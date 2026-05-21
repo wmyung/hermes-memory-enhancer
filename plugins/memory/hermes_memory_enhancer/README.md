@@ -150,8 +150,8 @@ During normal use:
 
 1. Hermes starts with `memory.provider: hermes_memory_enhancer`.
 2. The plugin reads configuration from the selected Hermes profile `.env`.
-3. Hermes calls provider methods for memory search, read, browse, remember, and resource ingestion.
-4. At session end, the plugin can send session-derived material to the Memory Enhancer server for extraction/indexing.
+3. Hermes calls provider methods for memory search, read, browse, and remember. Resource ingestion is opt-in and disabled by default.
+4. At session end, the plugin can send redacted, bounded session-derived material to the Memory Enhancer server for extraction/indexing.
 5. In later sessions, Hermes queries the provider and receives relevant context back as structured results.
 
 The plugin does **not** directly modify Hermes' built-in memory files or session database.
@@ -202,7 +202,7 @@ Do **not** put API keys, private DB paths, or long usage manuals in `MEMORY.md`.
 - `memory_enhancer_read`: read a `memory://` URI at `abstract`, `overview`, or `full` detail
 - `memory_enhancer_browse`: filesystem-style navigation using `list`, `tree`, or `stat`
 - `memory_enhancer_remember`: store a fact for extraction on session commit
-- `memory_enhancer_add_resource`: ingest URLs, files, or directories into the knowledge base
+- `memory_enhancer_add_resource`: opt-in resource ingestion. Disabled unless `MEMORY_ENHANCER_ENABLE_ADD_RESOURCE=true`; local uploads also require `MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS`.
 
 ## SQLite storage model
 
@@ -321,6 +321,14 @@ Environment variables in the selected Hermes profile `.env`:
 - `MEMORY_ENHANCER_ACCOUNT`: optional account/tenant label. Default: `default`
 - `MEMORY_ENHANCER_USER`: optional user/tenant label. Default: `default`
 - `MEMORY_ENHANCER_AGENT`: optional agent label. Default: `hermes`
+- `MEMORY_ENHANCER_PREFETCH_TOP_K`: automatic prefetch result count. Default: `3`; maximum: `10`
+- `MEMORY_ENHANCER_MAX_ABSTRACT_CHARS`: per-result abstract cap. Default: `500`; maximum: `2000`
+- `MEMORY_ENHANCER_SYNC_MAX_CHARS`: per-message session sync cap. Default: `4000`; maximum: `12000`
+- `MEMORY_ENHANCER_REDACT_SECRETS`: redact obvious credentials before sync/tool output. Default: `true`
+- `MEMORY_ENHANCER_ENABLE_ADD_RESOURCE`: enable `memory_enhancer_add_resource`. Default: `false`
+- `MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS`: `:`-separated allowlist for local file/directory uploads
+- `MEMORY_ENHANCER_ALLOW_INSECURE_REMOTE`: allow non-HTTPS non-loopback endpoints. Default: `false`
+- `MEMORY_ENHANCER_ALLOW_UNAUTHENTICATED_REMOTE`: allow remote endpoints without API key. Default: `false`
 
 Example `.env` block:
 

@@ -26,6 +26,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import tempfile
 import threading
 import uuid
@@ -43,6 +44,21 @@ logger = logging.getLogger(__name__)
 _DEFAULT_ENDPOINT = "http://127.0.0.1:1933"
 _TIMEOUT = 30.0
 _REMOTE_RESOURCE_PREFIXES = ("http://", "https://", "git@", "ssh://", "git://")
+_DEFAULT_PREFETCH_TOP_K = 3
+_DEFAULT_MAX_ABSTRACT_CHARS = 500
+_DEFAULT_SYNC_MAX_CHARS = 4000
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+_SECRET_PATTERNS = (
+    re.compile(r"(?i)(api[_-]?key|token|secret|password|passwd|authorization)\s*[:=]\s*[^\s,;]+"),
+    re.compile(r"(?i)(bearer\s+)[a-z0-9._~+/=-]{16,}"),
+    re.compile(r"gh[pousr]_[A-Za-z0-9_]{20,}"),
+    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
+)
+_SENSITIVE_PATH_PARTS = {
+    ".git", ".gnupg", ".hermes", ".ssh", ".aws", ".azure", ".config/gh",
+    "auth.json", "credentials", "id_rsa", "id_ed25519",
+}
+_SENSITIVE_NAME_HINTS = (".env", "secret", "token", "credential", "password", "passwd", "private_key")
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +98,105 @@ def _get_httpx():
         return None
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0, maximum: int | None = None) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def _endpoint_is_loopback(endpoint: str) -> bool:
+    parsed = urlparse(endpoint)
+    host = (parsed.hostname or "").lower()
+    return host in _LOOPBACK_HOSTS
+
+
+def _endpoint_security_error(endpoint: str, api_key: str) -> str:
+    parsed = urlparse(endpoint)
+    scheme = (parsed.scheme or "http").lower()
+    if _endpoint_is_loopback(endpoint):
+        return ""
+    if scheme != "https" and not _env_bool("MEMORY_ENHANCER_ALLOW_INSECURE_REMOTE", False):
+        return (
+            "Refusing Memory Enhancer remote non-HTTPS endpoint. Use https://, "
+            "127.0.0.1/localhost, or set MEMORY_ENHANCER_ALLOW_INSECURE_REMOTE=true."
+        )
+    if not api_key and not _env_bool("MEMORY_ENHANCER_ALLOW_UNAUTHENTICATED_REMOTE", False):
+        return (
+            "Refusing Memory Enhancer remote endpoint without API key. Set "
+            "MEMORY_ENHANCER_API_KEY or explicitly allow unauthenticated remote mode."
+        )
+    return ""
+
+
+def _redact_secrets(text: str) -> str:
+    if not text:
+        return text
+    redacted = text
+    for pattern in _SECRET_PATTERNS:
+        redacted = pattern.sub(lambda m: m.group(1) + " [REDACTED]" if m.groups() else "[REDACTED]", redacted)
+    return redacted
+
+
+def _truncate(value: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(value) <= max_chars:
+        return value
+    suffix = "\n\n[... truncated by Memory Enhancer client]"
+    if max_chars <= len(suffix):
+        return value[:max_chars]
+    return value[: max_chars - len(suffix)] + suffix
+
+
+def _configured_upload_roots() -> List[Path]:
+    raw = os.environ.get("MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS", "")
+    roots: List[Path] = []
+    for item in raw.split(os.pathsep):
+        item = item.strip()
+        if not item:
+            continue
+        roots.append(Path(item).expanduser().resolve())
+    return roots
+
+
+def _path_is_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _local_upload_security_error(path: Path) -> str:
+    resolved = path.expanduser().resolve()
+    name_lower = resolved.name.lower()
+    full_lower = str(resolved).lower()
+    if any(part in resolved.parts for part in _SENSITIVE_PATH_PARTS) or any(hint in name_lower for hint in _SENSITIVE_NAME_HINTS):
+        return f"Refusing to upload sensitive local path: {path}"
+    if any(part in full_lower for part in ("/.ssh/", "/.hermes/", "/.config/gh/", "/.aws/")):
+        return f"Refusing to upload sensitive local path: {path}"
+    roots = _configured_upload_roots()
+    if not roots:
+        return (
+            "Local resource uploads are disabled unless MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS "
+            "is set to one or more allowed directories."
+        )
+    if not any(_path_is_under(resolved, root) for root in roots):
+        return f"Local resource path is outside MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS: {path}"
+    return ""
+
 class _MemoryEnhancerClient:
+
     """Thin HTTP client for the Memory Enhancer REST API."""
 
     def __init__(self, endpoint: str, api_key: str = "",
@@ -288,9 +402,9 @@ REMEMBER_SCHEMA = {
 ADD_RESOURCE_SCHEMA = {
     "name": "memory_enhancer_add_resource",
     "description": (
-        "Add a remote URL or local file/directory to the Memory Enhancer knowledge base. "
-        "Remote resources must be public http(s), git, or ssh URLs. "
-        "Local files are uploaded first using Memory Enhancer temp_upload. "
+        "Add a remote URL or explicitly allowed local file/directory to the Memory Enhancer knowledge base. "
+        "Disabled by default; requires MEMORY_ENHANCER_ENABLE_ADD_RESOURCE=true. "
+        "Local uploads also require MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS and sensitive paths are refused. "
         "The system automatically parses, indexes, and generates summaries."
     ),
     "parameters": {
@@ -339,6 +453,8 @@ def _zip_directory(dir_path: Path) -> Path:
                 try:
                     file_path.resolve().relative_to(root)
                 except ValueError:
+                    continue
+                if _local_upload_security_error(file_path):
                     continue
                 arcname = str(file_path.relative_to(dir_path)).replace("\\", "/")
                 zipf.write(file_path, arcname=arcname)
@@ -396,6 +512,11 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread: Optional[threading.Thread] = None
+        self._prefetch_top_k = _DEFAULT_PREFETCH_TOP_K
+        self._max_abstract_chars = _DEFAULT_MAX_ABSTRACT_CHARS
+        self._sync_max_chars = _DEFAULT_SYNC_MAX_CHARS
+        self._redact_secrets = True
+        self._enable_add_resource = False
 
     @property
     def name(self) -> str:
@@ -448,6 +569,17 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
         self._agent = os.environ.get("MEMORY_ENHANCER_AGENT", "hermes")
         self._session_id = session_id
         self._turn_count = 0
+        self._prefetch_top_k = _env_int("MEMORY_ENHANCER_PREFETCH_TOP_K", _DEFAULT_PREFETCH_TOP_K, minimum=0, maximum=10)
+        self._max_abstract_chars = _env_int("MEMORY_ENHANCER_MAX_ABSTRACT_CHARS", _DEFAULT_MAX_ABSTRACT_CHARS, minimum=100, maximum=2000)
+        self._sync_max_chars = _env_int("MEMORY_ENHANCER_SYNC_MAX_CHARS", _DEFAULT_SYNC_MAX_CHARS, minimum=500, maximum=12000)
+        self._redact_secrets = _env_bool("MEMORY_ENHANCER_REDACT_SECRETS", True)
+        self._enable_add_resource = _env_bool("MEMORY_ENHANCER_ENABLE_ADD_RESOURCE", False)
+
+        security_error = _endpoint_security_error(self._endpoint, self._api_key)
+        if security_error:
+            logger.warning("%s", security_error)
+            self._client = None
+            return
 
         try:
             self._client = _MemoryEnhancerClient(
@@ -481,7 +613,8 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
                 f"Active. Endpoint: {self._endpoint}\n"
                 "Use memory_enhancer_search to find information, memory_enhancer_read for details "
                 "(abstract/overview/full), memory_enhancer_browse to explore.\n"
-                "Use memory_enhancer_remember to store facts, memory_enhancer_add_resource to index URLs/docs."
+                "Use memory_enhancer_remember to store durable facts. "
+                "memory_enhancer_add_resource is disabled unless explicitly enabled."
             )
         except Exception as e:
             logger.warning("Memory Enhancer system_prompt_block failed: %s", e)
@@ -489,25 +622,42 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
                 "# Memory Enhancer Knowledge Base\n"
                 f"Active. Endpoint: {self._endpoint}\n"
                 "Use memory_enhancer_search, memory_enhancer_read, memory_enhancer_browse, "
-                "memory_enhancer_remember, memory_enhancer_add_resource."
+                "memory_enhancer_remember. memory_enhancer_add_resource is disabled unless explicitly enabled."
             )
 
     def _format_prefetch_result(self, result: Dict[str, Any]) -> str:
         """Format search results for automatic prompt injection."""
         parts = []
+        remaining = self._sync_max_chars
         for ctx_type in ("memories", "resources", "skills"):
+            if remaining <= 0:
+                break
             items = result.get(ctx_type, []) if isinstance(result, dict) else []
-            for item in items[:3]:
+            for item in items[:self._prefetch_top_k]:
+                if remaining <= 0:
+                    break
                 uri = item.get("uri", "")
                 abstract = item.get("abstract", "")
+                if self._redact_secrets:
+                    abstract = _redact_secrets(abstract)
+                abstract = _truncate(abstract, self._max_abstract_chars)
                 score = item.get("score", 0)
                 if abstract:
                     try:
                         score_text = f"{float(score):.2f}"
                     except Exception:
                         score_text = "0.00"
-                    parts.append(f"- [{score_text}] {abstract} ({uri})")
+                    line = f"- [{score_text}] {abstract} ({uri})"
+                    if len(line) > remaining:
+                        line = _truncate(line, remaining)
+                    parts.append(line)
+                    remaining -= len(line) + 1
         return "\n".join(parts)
+
+    def _sanitize_prefetch_query(self, query: str) -> str:
+        if self._redact_secrets:
+            query = _redact_secrets(query)
+        return _truncate(query, self._sync_max_chars)
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Return relevant Memory Enhancer context for the current turn.
@@ -523,9 +673,10 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
             self._prefetch_result = ""
         if not result and self._client and query:
             try:
+                sanitized_query = self._sanitize_prefetch_query(query)
                 resp = self._client.post("/api/v1/search/find", {
-                    "query": query,
-                    "top_k": 5,
+                    "query": sanitized_query,
+                    "top_k": self._prefetch_top_k,
                 })
                 result = self._format_prefetch_result(resp.get("result", {}))
             except Exception as e:
@@ -546,9 +697,10 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
                     self._endpoint, self._api_key,
                     account=self._account, user=self._user, agent=self._agent,
                 )
+                sanitized_query = self._sanitize_prefetch_query(query)
                 resp = client.post("/api/v1/search/find", {
-                    "query": query,
-                    "top_k": 5,
+                    "query": sanitized_query,
+                    "top_k": self._prefetch_top_k,
                 })
                 formatted = self._format_prefetch_result(resp.get("result", {}))
                 if formatted:
@@ -577,15 +729,23 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
                 )
                 sid = self._session_id
 
+                user_text = user_content
+                assistant_text = assistant_content
+                if self._redact_secrets:
+                    user_text = _redact_secrets(user_text)
+                    assistant_text = _redact_secrets(assistant_text)
+                user_text = _truncate(user_text, self._sync_max_chars)
+                assistant_text = _truncate(assistant_text, self._sync_max_chars)
+
                 # Add user message
                 client.post(f"/api/v1/sessions/{sid}/messages", {
                     "role": "user",
-                    "content": user_content[:4000],  # trim very long messages
+                    "content": user_text,
                 })
                 # Add assistant message
                 client.post(f"/api/v1/sessions/{sid}/messages", {
                     "role": "assistant",
-                    "content": assistant_content[:4000],
+                    "content": assistant_text,
                 })
             except Exception as e:
                 logger.debug("Memory Enhancer sync_turn failed: %s", e)
@@ -634,12 +794,16 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
                     self._endpoint, self._api_key,
                     account=self._account, user=self._user, agent=self._agent,
                 )
+                memory_content = content
+                if self._redact_secrets:
+                    memory_content = _redact_secrets(memory_content)
+                memory_content = _truncate(memory_content, self._sync_max_chars)
                 # Add as a user message with memory context so the commit
                 # picks it up as an explicit memory during extraction
                 client.post(f"/api/v1/sessions/{self._session_id}/messages", {
                     "role": "user",
                     "parts": [
-                        {"type": "text", "text": f"[Memory note — {target}] {content}"},
+                        {"type": "text", "text": f"[Memory note — {target}] {memory_content}"},
                     ],
                 })
             except Exception as e:
@@ -726,6 +890,8 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
         query = args.get("query", "")
         if not query:
             return tool_error("query is required")
+        if self._redact_secrets:
+            query = _redact_secrets(query)
 
         payload: Dict[str, Any] = {"query": query}
         mode = args.get("mode", "auto")
@@ -746,11 +912,15 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
             for item in items:
                 raw_score = item.get("score")
                 sort_score = raw_score if raw_score is not None else 0.0
+                abstract = item.get("abstract", "")
+                if self._redact_secrets:
+                    abstract = _redact_secrets(abstract)
+                abstract = _truncate(abstract, self._max_abstract_chars)
                 entry = {
                     "uri": item.get("uri", ""),
                     "type": ctx_type.rstrip("s"),
                     "score": round(raw_score, 3) if raw_score is not None else 0.0,
-                    "abstract": item.get("abstract", ""),
+                    "abstract": abstract,
                 }
                 if item.get("relations"):
                     entry["related"] = [r.get("uri") for r in item["relations"][:3]]
@@ -823,6 +993,8 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
         elif level == "abstract":
             max_len = 1200
 
+        if self._redact_secrets:
+            content = _redact_secrets(content)
         if len(content) > max_len:
             content = content[:max_len] + "\n\n[... truncated, use a more specific URI or full level]"
 
@@ -859,11 +1031,15 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
                     uri = e.get("uri", "")
                     name = e.get("rel_path") or e.get("name") or (uri.rsplit("/", 1)[-1] if uri else "")
                     is_dir = bool(e.get("isDir") or e.get("is_dir") or e.get("type") == "dir")
+                    abstract = e.get("abstract", "")
+                    if self._redact_secrets:
+                        abstract = _redact_secrets(abstract)
+                    abstract = _truncate(abstract, self._max_abstract_chars)
                     entries.append({
                         "name": name,
                         "uri": uri,
                         "type": "dir" if is_dir else "file",
-                        "abstract": e.get("abstract", ""),
+                        "abstract": abstract,
                     })
                 return json.dumps({"path": path, "entries": entries}, ensure_ascii=False)
 
@@ -873,6 +1049,9 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
         content = args.get("content", "")
         if not content:
             return tool_error("content is required")
+        if self._redact_secrets:
+            content = _redact_secrets(content)
+        content = _truncate(content, self._sync_max_chars)
 
         # Store as a session message that will be extracted during commit.
         # The category hint helps Memory Enhancer's extraction classify correctly.
@@ -894,6 +1073,12 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
         })
 
     def _tool_add_resource(self, args: dict) -> str:
+        if not self._enable_add_resource:
+            return tool_error(
+                "memory_enhancer_add_resource is disabled by default. Set "
+                "MEMORY_ENHANCER_ENABLE_ADD_RESOURCE=true and "
+                "MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS for local uploads."
+            )
         url = args.get("url", "")
         if not url:
             return tool_error("url is required")
@@ -921,6 +1106,9 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
         cleanup_path: Optional[Path] = None
         try:
             if source_path is not None:
+                local_security_error = _local_upload_security_error(source_path)
+                if local_security_error:
+                    return tool_error(local_security_error)
                 if source_path.exists():
                     if source_path.is_dir():
                         payload["source_name"] = source_path.name

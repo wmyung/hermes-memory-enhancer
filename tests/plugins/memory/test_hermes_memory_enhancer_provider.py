@@ -8,6 +8,12 @@ import pytest
 from plugins.memory.hermes_memory_enhancer import HermesMemoryEnhancerProvider, _MemoryEnhancerClient
 
 
+def _enable_resource_tool(provider, monkeypatch=None, root=None):
+    provider._enable_add_resource = True
+    if monkeypatch is not None and root is not None:
+        monkeypatch.setenv("MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS", str(root))
+
+
 def test_tool_search_sorts_by_raw_score_across_buckets():
     provider = HermesMemoryEnhancerProvider()
     provider._client = MagicMock()
@@ -66,10 +72,11 @@ def test_tool_search_sorts_missing_raw_score_after_negative_scores():
     assert result["total"] == 3
 
 
-def test_tool_add_resource_uploads_existing_local_file(tmp_path):
+def test_tool_add_resource_uploads_existing_local_file(tmp_path, monkeypatch):
     sample = tmp_path / "sample.md"
     sample.write_text("# Local resource\n", encoding="utf-8")
     provider = HermesMemoryEnhancerProvider()
+    _enable_resource_tool(provider, monkeypatch, tmp_path)
     provider._client = MagicMock()
     provider._client.upload_temp_file.return_value = "upload_sample.md"
     provider._client.post.return_value = {
@@ -94,10 +101,11 @@ def test_tool_add_resource_uploads_existing_local_file(tmp_path):
     assert result["root_uri"] == "memory://resources/sample"
 
 
-def test_tool_add_resource_uploads_file_uri(tmp_path):
+def test_tool_add_resource_uploads_file_uri(tmp_path, monkeypatch):
     sample = tmp_path / "sample.md"
     sample.write_text("# Local resource\n", encoding="utf-8")
     provider = HermesMemoryEnhancerProvider()
+    _enable_resource_tool(provider, monkeypatch, tmp_path)
     provider._client = MagicMock()
     provider._client.upload_temp_file.return_value = "upload_sample.md"
     provider._client.post.return_value = {
@@ -120,7 +128,7 @@ def test_tool_add_resource_uploads_file_uri(tmp_path):
     assert result["root_uri"] == "memory://resources/sample"
 
 
-def test_tool_add_resource_uploads_existing_local_directory_and_cleans_zip(tmp_path):
+def test_tool_add_resource_uploads_existing_local_directory_and_cleans_zip(tmp_path, monkeypatch):
     docs = tmp_path / "docs"
     docs.mkdir()
     (docs / "guide.md").write_text("# Guide\n", encoding="utf-8")
@@ -128,6 +136,7 @@ def test_tool_add_resource_uploads_existing_local_directory_and_cleans_zip(tmp_p
     nested.mkdir()
     (nested / "api.md").write_text("# API\n", encoding="utf-8")
     provider = HermesMemoryEnhancerProvider()
+    _enable_resource_tool(provider, monkeypatch, tmp_path)
     provider._client = MagicMock()
     uploaded_paths = []
     provider._client.upload_temp_file.side_effect = (
@@ -157,7 +166,7 @@ def test_tool_add_resource_uploads_existing_local_directory_and_cleans_zip(tmp_p
     assert result["root_uri"] == "memory://resources/docs"
 
 
-def test_tool_add_resource_directory_zip_skips_symlink_escape(tmp_path):
+def test_tool_add_resource_directory_zip_skips_symlink_escape(tmp_path, monkeypatch):
     secret = tmp_path / "outside-secret.txt"
     secret.write_text("do not upload\n", encoding="utf-8")
     docs = tmp_path / "docs"
@@ -170,6 +179,7 @@ def test_tool_add_resource_directory_zip_skips_symlink_escape(tmp_path):
         pytest.skip(f"symlinks unavailable in test environment: {exc}")
 
     provider = HermesMemoryEnhancerProvider()
+    _enable_resource_tool(provider, monkeypatch, tmp_path)
     provider._client = MagicMock()
     archive_entries = {}
 
@@ -194,11 +204,12 @@ def test_tool_add_resource_directory_zip_skips_symlink_escape(tmp_path):
     assert b"do not upload" not in b"".join(archive_entries["payloads"].values())
 
 
-def test_tool_add_resource_cleans_local_directory_zip_when_add_fails(tmp_path):
+def test_tool_add_resource_cleans_local_directory_zip_when_add_fails(tmp_path, monkeypatch):
     docs = tmp_path / "docs"
     docs.mkdir()
     (docs / "guide.md").write_text("# Guide\n", encoding="utf-8")
     provider = HermesMemoryEnhancerProvider()
+    _enable_resource_tool(provider, monkeypatch, tmp_path)
     provider._client = MagicMock()
     uploaded_paths = []
     provider._client.upload_temp_file.side_effect = (
@@ -213,11 +224,12 @@ def test_tool_add_resource_cleans_local_directory_zip_when_add_fails(tmp_path):
     assert not uploaded_paths[0].exists()
 
 
-def test_tool_add_resource_cleans_local_directory_zip_when_upload_fails(tmp_path):
+def test_tool_add_resource_cleans_local_directory_zip_when_upload_fails(tmp_path, monkeypatch):
     docs = tmp_path / "docs"
     docs.mkdir()
     (docs / "guide.md").write_text("# Guide\n", encoding="utf-8")
     provider = HermesMemoryEnhancerProvider()
+    _enable_resource_tool(provider, monkeypatch, tmp_path)
     provider._client = MagicMock()
     uploaded_paths = []
 
@@ -235,9 +247,10 @@ def test_tool_add_resource_cleans_local_directory_zip_when_upload_fails(tmp_path
     provider._client.post.assert_not_called()
 
 
-def test_tool_add_resource_rejects_missing_local_path(tmp_path):
+def test_tool_add_resource_rejects_missing_local_path(tmp_path, monkeypatch):
     missing = tmp_path / "missing.md"
     provider = HermesMemoryEnhancerProvider()
+    _enable_resource_tool(provider, monkeypatch, tmp_path)
     provider._client = MagicMock()
 
     result = json.loads(provider._tool_add_resource({"url": str(missing)}))
@@ -249,6 +262,7 @@ def test_tool_add_resource_rejects_missing_local_path(tmp_path):
 
 def test_tool_add_resource_sends_remote_url_as_path():
     provider = HermesMemoryEnhancerProvider()
+    _enable_resource_tool(provider)
     provider._client = MagicMock()
     provider._client.post.return_value = {
         "status": "ok",
@@ -271,6 +285,7 @@ def test_tool_add_resource_sends_remote_url_as_path():
 ])
 def test_tool_add_resource_sends_git_remote_sources_as_path(url):
     provider = HermesMemoryEnhancerProvider()
+    _enable_resource_tool(provider)
     provider._client = MagicMock()
     provider._client.post.return_value = {
         "status": "ok",
