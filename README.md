@@ -153,26 +153,53 @@ Important defaults:
 - Do not store passwords, API keys, private keys, raw PHI/PII, or regulated data
 - Secret redaction is best-effort
 
-## AGENTS.md / MEMORY.md
+## Two-tier memory: Memory Enhancer + per-agent memory files
 
-You do **not** have to edit `AGENTS.md` or `MEMORY.md` for this provider to work. The required switch is:
+Memory Enhancer works alongside Hermes' built-in per-agent memory files
+(`MEMORY.md` / `USER.md`). These two storage tiers serve different purposes:
 
-```yaml
-memory:
-  provider: hermes_memory_enhancer
-```
+| Tier | Tool | Storage | Injected every turn? |
+|------|------|---------|---------------------|
+| **Per-agent memory** | `memory` tool | `{hermes_home}/memories/MEMORY.md` / `USER.md` | ✅ Yes — always injected |
+| **Shared knowledge base** | `memory_enhancer_*` tools | SQLite database (Memory Enhancer) | ❌ No — searched when needed |
 
-For better agent behavior, add this to the relevant `AGENTS.md`:
+**Why this matters:** The per-agent memory files are automatically injected into
+every conversation turn, making them ideal for rules, preferences, and identity
+that the agent should always follow. The Memory Enhancer DB stores durable
+shared knowledge that is searched on demand — important rules stored only there
+may be missed unless the agent actively searches.
+
+### Workflow: promoting rules to per-agent memory
+
+When an agent discovers a rule, preference, or pattern that should be injected
+every turn:
+
+1. Store it in Memory Enhancer via `memory_enhancer_remember` (shared DB)
+2. **Also** write it to the agent's per-agent memory via the `memory` tool:
+
+   ```
+   memory(target='memory', action='add', content='...')   → MEMORY.md
+   memory(target='user', action='add', content='...')     → USER.md
+   ```
+
+**When to promote:**
+- A newly discovered user preference or behavioral rule
+- A frequently-needed workflow pattern
+- An identity or role definition
+- A critical security or operational constraint
+
+### Adding to AGENTS.md / SOUL.md
+
+For better agent awareness, add this to each agent's `AGENTS.md` / `SOUL.md`:
 
 ```markdown
 ## Memory Enhancer usage
-
-This Hermes profile uses the Hermes Memory Enhancer provider.
-Use:
 - `memory_enhancer_search` for semantic lookup
 - `memory_enhancer_read` for `memory://` URIs returned by search
 - `memory_enhancer_browse` to inspect stored knowledge hierarchy
-Store durable project facts with `memory_enhancer_remember`.
+- `memory_enhancer_remember` for durable project facts
+- When you find a rule/pattern worth injecting every turn, also write it to
+  MEMORY.md (for personal notes) or USER.md (for user facts) via the `memory` tool
 ```
 
 ## Removal
