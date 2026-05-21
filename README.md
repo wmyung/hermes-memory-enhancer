@@ -4,6 +4,11 @@
 
 It is designed specifically for Hermes users who need more than a small profile note or a flat list of remembered facts. The plugin connects Hermes to a self-hosted context database that can store session-derived memories, indexed resources, and structured knowledge in a filesystem-like hierarchy, then retrieve the right context back into future Hermes conversations.
 
+
+## Keywords
+
+Hermes Agent memory provider, AI agent memory, persistent memory, semantic memory, long-term memory, self-hosted memory, SQLite memory backend, context database, session memory, agent knowledge base, retrieval-augmented memory, RAG memory, personal AI assistant memory, local-first AI, private AI memory, filesystem-style knowledge base, memory search, memory extraction, Hermes plugin.
+
 ## What this repository contains
 
 This repository is the **Hermes integration layer**:
