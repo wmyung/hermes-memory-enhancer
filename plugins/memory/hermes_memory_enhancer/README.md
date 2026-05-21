@@ -341,6 +341,22 @@ MEMORY_ENHANCER_AGENT=hermes
 # MEMORY_ENHANCER_API_KEY=replace-if-server-requires-auth
 ```
 
+## Security notes
+
+See [`../../../SECURITY.md`](../../../SECURITY.md) for the full security policy.
+
+Important defaults:
+
+- Prefer loopback for local use: `MEMORY_ENHANCER_ENDPOINT=http://127.0.0.1:1933`.
+- Non-loopback remote endpoints must use HTTPS unless `MEMORY_ENHANCER_ALLOW_INSECURE_REMOTE=true` is explicitly set.
+- Non-loopback remote endpoints require `MEMORY_ENHANCER_API_KEY` unless `MEMORY_ENHANCER_ALLOW_UNAUTHENTICATED_REMOTE=true` is explicitly set.
+- `memory_enhancer_add_resource` is disabled unless `MEMORY_ENHANCER_ENABLE_ADD_RESOURCE=true` is explicitly set.
+- Local file/directory ingestion requires a narrow `MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS` allowlist.
+- Do not allow broad upload roots such as `/`, `/home`, `/home/user`, or `~`.
+- Keep `.env` files, API keys, private DB paths, and SQLite databases out of Git.
+- Do not store passwords, API keys, private keys, raw PHI/PII, or regulated data unless your own deployment policy explicitly allows it.
+- Secret redaction is best-effort; it is not a complete data-loss-prevention system.
+
 ## Operational notes
 
 - Restart Hermes CLI/gateway after changing `memory.provider` or `.env`.
@@ -393,4 +409,4 @@ Use real project names, agent names, private paths, and credentials only in a lo
 
 ## Current status
 
-Private staging snapshot for Hermes Memory Enhancer plugin development.
+Public Hermes Memory Enhancer plugin integration layer. Server implementation is separate.
