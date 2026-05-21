@@ -1,22 +1,18 @@
 name: hermes_memory_enhancer
 version: 2.0.0
-description: "Memory Enhancer context database — session-managed memory with automatic extraction, tiered retrieval, and filesystem-style knowledge browsing."
-pip_dependencies:
-  - httpx
+description: "Memory Enhancer context database — SQLite-backed session-managed memory with automatic extraction, tiered retrieval, and filesystem-style knowledge browsing."
+pip_dependencies: []
 requires_env:
-  - MEMORY_ENHANCER_ENDPOINT
+ - MEMORY_ENHANCER_DB_PATH
 optional_env:
-  - MEMORY_ENHANCER_API_KEY
-  - MEMORY_ENHANCER_ACCOUNT
-  - MEMORY_ENHANCER_USER
-  - MEMORY_ENHANCER_AGENT
-  - MEMORY_ENHANCER_PREFETCH_TOP_K
-  - MEMORY_ENHANCER_MAX_ABSTRACT_CHARS
-  - MEMORY_ENHANCER_SYNC_MAX_CHARS
-  - MEMORY_ENHANCER_REDACT_SECRETS
-  - MEMORY_ENHANCER_ENABLE_ADD_RESOURCE
-  - MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS
-  - MEMORY_ENHANCER_ALLOW_INSECURE_REMOTE
-  - MEMORY_ENHANCER_ALLOW_UNAUTHENTICATED_REMOTE
+ - MEMORY_ENHANCER_ACCOUNT
+ - MEMORY_ENHANCER_USER
+ - MEMORY_ENHANCER_AGENT
+ - MEMORY_ENHANCER_PREFETCH_TOP_K
+ - MEMORY_ENHANCER_MAX_ABSTRACT_CHARS
+ - MEMORY_ENHANCER_SYNC_MAX_CHARS
+ - MEMORY_ENHANCER_REDACT_SECRETS
+ - MEMORY_ENHANCER_ENABLE_ADD_RESOURCE
+ - MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS
 hooks:
-  - on_session_end
+ - on_session_end

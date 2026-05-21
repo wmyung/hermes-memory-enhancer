@@ -1,437 +1,374 @@
 import json
-import zipfile
-from types import SimpleNamespace
-from unittest.mock import MagicMock
+import os
+import tempfile
 
 import pytest
 
-from plugins.memory.hermes_memory_enhancer import HermesMemoryEnhancerProvider, _MemoryEnhancerClient
+from plugins.memory.hermes_memory_enhancer import (
+    HermesMemoryEnhancerProvider,
+    _redact_secrets,
+    _truncate,
+    _local_upload_security_error,
+    _is_remote_resource_source,
+    _is_local_path_reference,
+    _SECRET_PATTERNS,
+)
 
 
-def _enable_resource_tool(provider, monkeypatch=None, root=None):
-    provider._enable_add_resource = True
-    if monkeypatch is not None and root is not None:
-        monkeypatch.setenv("MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS", str(root))
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
+
+class ProviderWithDB:
+    """Context manager that creates a provider with temporary SQLite database."""
+
+    def __init__(self, agent="hermes"):
+        self.agent = agent
+        self._tmp_db = None
+        self.provider = None
+
+    def __enter__(self):
+        self._tmp_db = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        self._tmp_db.close()
+        os.environ["MEMORY_ENHANCER_DB_PATH"] = self._tmp_db.name
+        os.environ["MEMORY_ENHANCER_AGENT"] = self.agent
+        self.provider = HermesMemoryEnhancerProvider()
+        self.provider.initialize("test-session")
+        return self.provider
+
+    def __exit__(self, *args):
+        if self.provider:
+            try:
+                self.provider.shutdown()
+            except Exception:
+                pass
+        if self._tmp_db:
+            try:
+                os.unlink(self._tmp_db.name)
+            except OSError:
+                pass
 
 
-def test_tool_search_sorts_by_raw_score_across_buckets():
-    provider = HermesMemoryEnhancerProvider()
-    provider._client = MagicMock()
-    provider._client.post.return_value = {
-        "result": {
-            "memories": [
-                {"uri": "memory://memories/1", "score": 0.9003, "abstract": "memory result"},
-            ],
-            "resources": [
-                {"uri": "memory://resources/1", "score": 0.9004, "abstract": "resource result"},
-            ],
-            "skills": [
-                {"uri": "memory://skills/1", "score": 0.8999, "abstract": "skill result"},
-            ],
-            "total": 3,
-        }
-    }
+# ---------------------------------------------------------------------------
+# Search tests
+# ---------------------------------------------------------------------------
 
-    result = json.loads(provider._tool_search({"query": "ranking"}))
-
-    assert [entry["uri"] for entry in result["results"]] == [
-        "memory://resources/1",
-        "memory://memories/1",
-        "memory://skills/1",
-    ]
-    assert [entry["score"] for entry in result["results"]] == [0.9, 0.9, 0.9]
-    assert result["total"] == 3
-
-
-def test_tool_search_sorts_missing_raw_score_after_negative_scores():
-    provider = HermesMemoryEnhancerProvider()
-    provider._client = MagicMock()
-    provider._client.post.return_value = {
-        "result": {
-            "memories": [
-                {"uri": "memory://memories/missing", "abstract": "missing score"},
-            ],
-            "resources": [
-                {"uri": "memory://resources/negative", "score": -0.25, "abstract": "negative score"},
-            ],
-            "skills": [
-                {"uri": "memory://skills/positive", "score": 0.1, "abstract": "positive score"},
-            ],
-            "total": 3,
-        }
-    }
-
-    result = json.loads(provider._tool_search({"query": "ranking"}))
-
-    assert [entry["uri"] for entry in result["results"]] == [
-        "memory://skills/positive",
-        "memory://memories/missing",
-        "memory://resources/negative",
-    ]
-    assert [entry["score"] for entry in result["results"]] == [0.1, 0.0, -0.25]
-    assert result["total"] == 3
-
-
-def test_tool_add_resource_uploads_existing_local_file(tmp_path, monkeypatch):
-    sample = tmp_path / "sample.md"
-    sample.write_text("# Local resource\n", encoding="utf-8")
-    provider = HermesMemoryEnhancerProvider()
-    _enable_resource_tool(provider, monkeypatch, tmp_path)
-    provider._client = MagicMock()
-    provider._client.upload_temp_file.return_value = "upload_sample.md"
-    provider._client.post.return_value = {
-        "status": "ok",
-        "result": {"root_uri": "memory://resources/sample"},
-    }
-
-    result = json.loads(provider._tool_add_resource({
-        "url": str(sample),
-        "reason": "local test",
-        "wait": True,
-    }))
-
-    provider._client.upload_temp_file.assert_called_once_with(sample)
-    provider._client.post.assert_called_once_with("/api/v1/resources", {
-        "reason": "local test",
-        "wait": True,
-        "source_name": "sample.md",
-        "temp_file_id": "upload_sample.md",
-    })
-    assert result["status"] == "added"
-    assert result["root_uri"] == "memory://resources/sample"
-
-
-def test_tool_add_resource_uploads_file_uri(tmp_path, monkeypatch):
-    sample = tmp_path / "sample.md"
-    sample.write_text("# Local resource\n", encoding="utf-8")
-    provider = HermesMemoryEnhancerProvider()
-    _enable_resource_tool(provider, monkeypatch, tmp_path)
-    provider._client = MagicMock()
-    provider._client.upload_temp_file.return_value = "upload_sample.md"
-    provider._client.post.return_value = {
-        "status": "ok",
-        "result": {"root_uri": "memory://resources/sample"},
-    }
-
-    result = json.loads(provider._tool_add_resource({
-        "url": sample.as_uri(),
-        "reason": "file uri test",
-    }))
-
-    provider._client.upload_temp_file.assert_called_once_with(sample)
-    provider._client.post.assert_called_once_with("/api/v1/resources", {
-        "reason": "file uri test",
-        "source_name": "sample.md",
-        "temp_file_id": "upload_sample.md",
-    })
-    assert result["status"] == "added"
-    assert result["root_uri"] == "memory://resources/sample"
-
-
-def test_tool_add_resource_uploads_existing_local_directory_and_cleans_zip(tmp_path, monkeypatch):
-    docs = tmp_path / "docs"
-    docs.mkdir()
-    (docs / "guide.md").write_text("# Guide\n", encoding="utf-8")
-    nested = docs / "nested"
-    nested.mkdir()
-    (nested / "api.md").write_text("# API\n", encoding="utf-8")
-    provider = HermesMemoryEnhancerProvider()
-    _enable_resource_tool(provider, monkeypatch, tmp_path)
-    provider._client = MagicMock()
-    uploaded_paths = []
-    provider._client.upload_temp_file.side_effect = (
-        lambda path: uploaded_paths.append(path) or "upload_docs.zip"
-    )
-    provider._client.post.return_value = {
-        "status": "ok",
-        "result": {"root_uri": "memory://resources/docs"},
-    }
-
-    result = json.loads(provider._tool_add_resource({
-        "url": str(docs),
-        "reason": "directory test",
-        "wait": True,
-    }))
-
-    assert uploaded_paths
-    assert uploaded_paths[0].suffix == ".zip"
-    assert not uploaded_paths[0].exists()
-    provider._client.post.assert_called_once_with("/api/v1/resources", {
-        "reason": "directory test",
-        "wait": True,
-        "source_name": "docs",
-        "temp_file_id": "upload_docs.zip",
-    })
-    assert result["status"] == "added"
-    assert result["root_uri"] == "memory://resources/docs"
-
-
-def test_tool_add_resource_directory_zip_skips_symlink_escape(tmp_path, monkeypatch):
-    secret = tmp_path / "outside-secret.txt"
-    secret.write_text("do not upload\n", encoding="utf-8")
-    docs = tmp_path / "docs"
-    docs.mkdir()
-    (docs / "guide.md").write_text("# Guide\n", encoding="utf-8")
-    link = docs / "leak.txt"
-    try:
-        link.symlink_to(secret)
-    except OSError as exc:
-        pytest.skip(f"symlinks unavailable in test environment: {exc}")
-
-    provider = HermesMemoryEnhancerProvider()
-    _enable_resource_tool(provider, monkeypatch, tmp_path)
-    provider._client = MagicMock()
-    archive_entries = {}
-
-    def inspect_upload(path):
-        with zipfile.ZipFile(path) as archive:
-            archive_entries["names"] = archive.namelist()
-            archive_entries["payloads"] = {
-                name: archive.read(name)
-                for name in archive.namelist()
-            }
-        return "upload_docs.zip"
-
-    provider._client.upload_temp_file.side_effect = inspect_upload
-    provider._client.post.return_value = {
-        "status": "ok",
-        "result": {"root_uri": "memory://resources/docs"},
-    }
-
-    json.loads(provider._tool_add_resource({"url": str(docs)}))
-
-    assert archive_entries["names"] == ["guide.md"]
-    assert b"do not upload" not in b"".join(archive_entries["payloads"].values())
-
-
-def test_tool_add_resource_cleans_local_directory_zip_when_add_fails(tmp_path, monkeypatch):
-    docs = tmp_path / "docs"
-    docs.mkdir()
-    (docs / "guide.md").write_text("# Guide\n", encoding="utf-8")
-    provider = HermesMemoryEnhancerProvider()
-    _enable_resource_tool(provider, monkeypatch, tmp_path)
-    provider._client = MagicMock()
-    uploaded_paths = []
-    provider._client.upload_temp_file.side_effect = (
-        lambda path: uploaded_paths.append(path) or "upload_docs.zip"
-    )
-    provider._client.post.side_effect = RuntimeError("add failed")
-
-    with pytest.raises(RuntimeError, match="add failed"):
-        provider._tool_add_resource({"url": str(docs)})
-
-    assert uploaded_paths
-    assert not uploaded_paths[0].exists()
-
-
-def test_tool_add_resource_cleans_local_directory_zip_when_upload_fails(tmp_path, monkeypatch):
-    docs = tmp_path / "docs"
-    docs.mkdir()
-    (docs / "guide.md").write_text("# Guide\n", encoding="utf-8")
-    provider = HermesMemoryEnhancerProvider()
-    _enable_resource_tool(provider, monkeypatch, tmp_path)
-    provider._client = MagicMock()
-    uploaded_paths = []
-
-    def fail_upload(path):
-        uploaded_paths.append(path)
-        raise RuntimeError("upload failed")
-
-    provider._client.upload_temp_file.side_effect = fail_upload
-
-    with pytest.raises(RuntimeError, match="upload failed"):
-        provider._tool_add_resource({"url": str(docs)})
-
-    assert uploaded_paths
-    assert not uploaded_paths[0].exists()
-    provider._client.post.assert_not_called()
-
-
-def test_tool_add_resource_rejects_missing_local_path(tmp_path, monkeypatch):
-    missing = tmp_path / "missing.md"
-    provider = HermesMemoryEnhancerProvider()
-    _enable_resource_tool(provider, monkeypatch, tmp_path)
-    provider._client = MagicMock()
-
-    result = json.loads(provider._tool_add_resource({"url": str(missing)}))
-
-    assert result["error"] == f"Local resource path does not exist: {missing}"
-    provider._client.upload_temp_file.assert_not_called()
-    provider._client.post.assert_not_called()
-
-
-def test_tool_add_resource_sends_remote_url_as_path():
-    provider = HermesMemoryEnhancerProvider()
-    _enable_resource_tool(provider)
-    provider._client = MagicMock()
-    provider._client.post.return_value = {
-        "status": "ok",
-        "result": {"root_uri": "memory://resources/remote"},
-    }
-
-    provider._tool_add_resource({"url": "https://example.com/doc.md"})
-
-    provider._client.upload_temp_file.assert_not_called()
-    provider._client.post.assert_called_once_with("/api/v1/resources", {
-        "path": "https://example.com/doc.md",
-    })
-
-
-@pytest.mark.parametrize("url", [
-    "git@github.com:org/repo.git",
-    "git@ssh.dev.azure.com:v3/org/project/repo",
-    "ssh://git@github.com/org/repo.git",
-    "git://github.com/org/repo.git",
-])
-def test_tool_add_resource_sends_git_remote_sources_as_path(url):
-    provider = HermesMemoryEnhancerProvider()
-    _enable_resource_tool(provider)
-    provider._client = MagicMock()
-    provider._client.post.return_value = {
-        "status": "ok",
-        "result": {"root_uri": "memory://resources/repo"},
-    }
-
-    provider._tool_add_resource({"url": url})
-
-    provider._client.upload_temp_file.assert_not_called()
-    provider._client.post.assert_called_once_with("/api/v1/resources", {
-        "path": url,
-    })
-
-
-def test_memory_enhancer_client_upload_temp_file_uses_multipart_identity_headers(tmp_path, monkeypatch):
-    sample = tmp_path / "sample.md"
-    sample.write_text("# Local resource\n", encoding="utf-8")
-    client = _MemoryEnhancerClient(
-        "https://example.com",
-        api_key="test-key",
-        account="test-account",
-        user="test-user",
-        agent="test-agent",
-    )
-    captured_kwargs = {}
-
-    def capture_httpx_post(url, **kwargs):
-        captured_kwargs.update(kwargs)
-        return SimpleNamespace(
-            status_code=200,
-            text="",
-            json=lambda: {"status": "ok", "result": {"temp_file_id": "upload_sample.md"}},
-            raise_for_status=lambda: None,
+def test_tool_search_returns_results():
+    with ProviderWithDB() as provider:
+        # Seed some content via resource
+        provider._db.add_resource(
+            "memory://resources/paper1.md", "paper1.md",
+            "This paper discusses the genetic basis of schizophrenia.",
+        )
+        provider._db.add_resource(
+            "memory://resources/paper2.md", "paper2.md",
+            "Another paper about treatment outcomes in depression.",
         )
 
-    monkeypatch.setattr(client._httpx, "post", capture_httpx_post)
+        result = json.loads(provider._tool_search({"query": "schizophrenia", "limit": 10}))
 
-    assert client.upload_temp_file(sample) == "upload_sample.md"
-
-    assert "files" in captured_kwargs
-    assert "json" not in captured_kwargs
-    headers = captured_kwargs["headers"]
-    assert headers["X-Memory-Enhancer-Account"] == "test-account"
-    assert headers["X-Memory-Enhancer-User"] == "test-user"
-    assert headers["X-Memory-Enhancer-Agent"] == "test-agent"
-    assert headers["X-API-Key"] == "test-key"
-    assert "Content-Type" not in headers
+        assert result["total"] >= 1
+        uris = [r["uri"] for r in result["results"]]
+        assert any("paper1" in u for u in uris)
 
 
-def test_memory_enhancer_client_raises_structured_server_error():
-    client = _MemoryEnhancerClient.__new__(_MemoryEnhancerClient)
-    response = SimpleNamespace(
-        status_code=403,
-        text='{"status":"error"}',
-        json=lambda: {
-            "status": "error",
-            "error": {
-                "code": "PERMISSION_DENIED",
-                "message": "direct host filesystem paths are not allowed",
-            },
-        },
-        raise_for_status=lambda: None,
-    )
+def test_tool_search_sorts_by_score():
+    with ProviderWithDB() as provider:
+        provider._db.add_resource(
+            "memory://resources/a.md", "a.md",
+            "Machine learning methods for genomic analysis.",
+        )
+        provider._db.add_resource(
+            "memory://resources/b.md", "b.md",
+            "Statistical power analysis for genetic studies.",
+        )
 
-    with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
-        client._parse_response(response)
-
-
-def test_memory_enhancer_client_headers_include_bearer_when_api_key_set():
-    client = _MemoryEnhancerClient(
-        "https://example.com",
-        api_key="test-key",
-        account="acct",
-        user="usr",
-        agent="hermes",
-    )
-    headers = client._headers()
-    assert headers["X-API-Key"] == "test-key"
-    assert headers["Authorization"] == "Bearer test-key"
+        result = json.loads(provider._tool_search({"query": "genetic analysis", "limit": 10}))
+        assert result["total"] >= 1
+        # Results should be sorted by score descending
+        scores = [r["score"] for r in result["results"]]
+        assert scores == sorted(scores, reverse=True)
 
 
-def test_memory_enhancer_client_headers_send_tenant_when_default():
-    # account/user set to the literal string "default". Memory Enhancer 0.3.x
-    # requires X-Memory-Enhancer-Account and X-Memory-Enhancer-User for ROOT API key
-    # requests to tenant-scoped APIs — omitting them causes
-    # INVALID_ARGUMENT errors even when account="default".
-    client = _MemoryEnhancerClient(
-        "https://example.com",
-        api_key="test-key",
-        account="default",
-        user="default",
-        agent="hermes",
-    )
-    headers = client._headers()
-    assert headers["X-Memory-Enhancer-Account"] == "default"
-    assert headers["X-Memory-Enhancer-User"] == "default"
-    assert headers["X-Memory-Enhancer-Agent"] == "hermes"
-    assert headers["Authorization"] == "Bearer test-key"
+def test_tool_search_with_scope():
+    with ProviderWithDB() as provider:
+        provider._db.add_resource(
+            "memory://resources/doc.md", "doc.md",
+            "GWAS analysis results for depression.",
+        )
+        provider._db.add_resource(
+            "memory://user/hermes/memories/note.md", "note.md",
+            "Personal note about GWAS methodology.",
+        )
+
+        # Scope to resources only
+        result = json.loads(provider._tool_search({
+            "query": "GWAS",
+            "scope": "memory://resources",
+            "limit": 10,
+        }))
+        uris = [r["uri"] for r in result["results"]]
+        # Only resource-scoped results should appear
+        assert len(uris) > 0
+        assert all("resources" in u for u in uris)
 
 
-def test_memory_enhancer_client_headers_send_tenant_when_empty_falls_back_to_default():
-    # Empty account/user strings fall back to "default" via the constructor.
-    # Headers are sent even for the default value — ROOT API keys need them.
-    client = _MemoryEnhancerClient(
-        "https://example.com",
-        api_key="",
-        account="",
-        user="",
-        agent="hermes",
-    )
-    headers = client._headers()
-    assert headers["X-Memory-Enhancer-Account"] == "default"
-    assert headers["X-Memory-Enhancer-User"] == "default"
-    assert "Authorization" not in headers
-    assert "X-API-Key" not in headers
+# ---------------------------------------------------------------------------
+# Read tests
+# ---------------------------------------------------------------------------
+
+def test_tool_read_nonexistent_uri():
+    with ProviderWithDB() as provider:
+        result = json.loads(provider._tool_read({
+            "uri": "memory://resources/nonexistent.md",
+            "level": "full",
+        }))
+        assert result["content"] == ""
 
 
-def test_memory_enhancer_client_headers_sent_with_real_tenant_values():
-    client = _MemoryEnhancerClient(
-        "https://example.com",
-        api_key="test-key",
-        account="real-account",
-        user="real-user",
-        agent="hermes",
-    )
-    headers = client._headers()
-    assert headers["X-Memory-Enhancer-Account"] == "real-account"
-    assert headers["X-Memory-Enhancer-User"] == "real-user"
+def test_tool_read_overview_file():
+    with ProviderWithDB() as provider:
+        provider._db.add_resource(
+            "memory://resources/doc.md", "doc.md",
+            "Full content here.",
+            abstract="Abstract text.",
+            source_url="/tmp/doc.md",
+        )
+        # Force overview = abstract for non-dir resources
+        result = json.loads(provider._tool_read({
+            "uri": "memory://resources/doc.md",
+            "level": "overview",
+        }))
+        assert result["level"] == "overview"
+        assert result["content"]  # Should have content (falls back to full)
 
 
-def test_memory_enhancer_client_health_sends_auth_headers(monkeypatch):
-    client = _MemoryEnhancerClient(
-        "https://example.com",
-        api_key="test-key",
-        account="",
-        user="",
-        agent="hermes",
-    )
-    captured = {}
+# ---------------------------------------------------------------------------
+# Browse tests
+# ---------------------------------------------------------------------------
 
-    def capture_get(url, **kwargs):
-        captured["url"] = url
-        captured["headers"] = kwargs.get("headers") or {}
-        return SimpleNamespace(status_code=200)
+def test_browse_list():
+    with ProviderWithDB() as provider:
+        result = json.loads(provider._tool_browse({"action": "list", "path": "memory://"}))
+        assert result["path"] == "memory://"
+        entries = result["entries"]
+        names = {e["name"] for e in entries}
+        assert "user" in names
+        assert "resources" in names
 
-    monkeypatch.setattr(client._httpx, "get", capture_get)
-    assert client.health() is True
-    assert captured["url"] == "https://example.com/health"
-    assert captured["headers"]["Authorization"] == "Bearer test-key"
+
+def test_browse_tree():
+    with ProviderWithDB() as provider:
+        result = json.loads(provider._tool_browse({"action": "tree", "path": "memory://"}))
+        assert "entries" in result
+        entries = result["entries"]
+        assert len(entries) >= 2
+        # Each entry should have depth
+        assert all("depth" in e for e in entries)
+
+
+def test_browse_stat():
+    with ProviderWithDB() as provider:
+        result = json.loads(provider._tool_browse({"action": "stat", "path": "memory://user"}))
+        assert result["uri"] == "memory://user"
+        assert result["name"] == "user"
+        assert result["type"] == "dir"
+
+
+# ---------------------------------------------------------------------------
+# Remember tests
+# ---------------------------------------------------------------------------
+
+def test_remember_explicit_memory():
+    with ProviderWithDB() as provider:
+        result = json.loads(provider._tool_remember({
+            "content": "The user's favorite color is blue",
+            "category": "preference",
+        }))
+        assert result["status"] == "stored"
+
+        # Verify it's searchable
+        search_result = json.loads(provider._tool_search({
+            "query": "favorite color",
+            "limit": 10,
+        }))
+        assert search_result["total"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Add resource tests
+# ---------------------------------------------------------------------------
+
+def test_add_resource_local_file(tmp_path, monkeypatch):
+    sample = tmp_path / "sample.md"
+    sample.write_text("# Local resource\n", encoding="utf-8")
+
+    with ProviderWithDB() as provider:
+        provider._enable_add_resource = True
+        monkeypatch.setenv("MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS", str(tmp_path))
+
+        result = json.loads(provider._tool_add_resource({
+            "url": str(sample),
+            "reason": "local test",
+        }))
+
+        assert result["status"] == "added"
+        assert "resources" in result["root_uri"]
+
+
+def test_add_resource_missing_file(monkeypatch):
+    with ProviderWithDB() as provider:
+        provider._enable_add_resource = True
+        monkeypatch.setenv("MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS", "/tmp")
+
+        result = json.loads(provider._tool_add_resource({
+            "url": "/tmp/nonexistent-12345.md",
+        }))
+
+        assert "error" in result
+
+
+def test_add_resource_rejects_remote_url():
+    with ProviderWithDB() as provider:
+        provider._enable_add_resource = True
+
+        result = json.loads(provider._tool_add_resource({
+            "url": "https://example.com/doc.md",
+        }))
+
+        assert "error" in result
+
+
+def test_add_resource_rejects_when_disabled():
+    with ProviderWithDB() as provider:
+        result = json.loads(provider._tool_add_resource({
+            "url": "/tmp/test.md",
+        }))
+
+        assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# Security tests
+# ---------------------------------------------------------------------------
+
+def test_redact_secrets():
+    text = "My API key is sk-1234567890abcdef123456 and token=secret123"
+    result = _redact_secrets(text)
+    assert "sk-1234567890abcdef123456" not in result
+    assert "secret123" not in result
+    assert "[REDACTED]" in result
+
+
+def test_truncate_short_text():
+    text = "Short text"
+    assert _truncate(text, 100) == text
+
+
+def test_truncate_long_text():
+    text = "A" * 1000
+    result = _truncate(text, 100)
+    assert len(result) <= 100 + 50  # truncation suffix adds some chars
+    assert "[... truncated" in result
+
+
+def test_local_upload_security_error_sensitive_paths():
+    from pathlib import Path
+    result = _local_upload_security_error(Path("/home/user/.ssh/id_rsa"))
+    assert "sensitive" in result.lower() or "refusing" in result.lower()
+
+
+def test_local_upload_security_error_outside_roots(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS", raising=False)
+    result = _local_upload_security_error(tmp_path / "test.md")
+    assert result  # Should be an error since MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS is not set
+
+
+def test_is_remote_resource_source():
+    assert _is_remote_resource_source("https://example.com")
+    assert _is_remote_resource_source("git@github.com:org/repo.git")
+    assert not _is_remote_resource_source("/local/path")
+    assert not _is_remote_resource_source("relative/path.md")
+
+
+def test_is_local_path_reference():
+    assert _is_local_path_reference("/absolute/path")
+    assert _is_local_path_reference("./relative")
+    assert _is_local_path_reference("../parent")
+    assert not _is_local_path_reference("https://example.com")
+
+
+# ---------------------------------------------------------------------------
+# Session lifecycle tests
+# ---------------------------------------------------------------------------
+
+def test_full_session_flow():
+    with ProviderWithDB() as provider:
+        # Simulate a conversation
+        provider.sync_turn("Hello", "Hi! How can I help?")
+        import time
+        time.sleep(0.2)
+
+        provider.sync_turn("My project is about PTSD genetics", "I'll remember that.")
+        time.sleep(0.2)
+
+        provider._tool_remember({"content": "Project focus: PTSD genetics GWAS", "category": "project"})
+
+        # Commit the session
+        provider._turn_count = 2
+        provider.on_session_end([])
+
+        # Search should find the remembered content
+        result = json.loads(provider._tool_search({
+            "query": "PTSD genetics",
+            "limit": 10,
+        }))
+        assert result["total"] >= 1
+
+
+def test_provider_name_and_availability():
+    # Test without env var set
+    if "MEMORY_ENHANCER_DB_PATH" in os.environ:
+        del os.environ["MEMORY_ENHANCER_DB_PATH"]
+    provider = HermesMemoryEnhancerProvider()
+    assert provider.name == "hermes_memory_enhancer"
+    assert not provider.is_available()
+
+    # Test with env var set
+    with ProviderWithDB() as provider2:
+        assert provider2.is_available()
+
+
+def test_initialize_creates_db():
+    """Test that initialize creates the database file."""
+    tmp_db = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+    tmp_db.close()
+    try:
+        os.environ["MEMORY_ENHANCER_DB_PATH"] = tmp_db.name
+        provider = HermesMemoryEnhancerProvider()
+        provider.initialize("test-session")
+        assert os.path.exists(tmp_db.name)
+        provider.shutdown()
+    finally:
+        try:
+            os.unlink(tmp_db.name)
+        except OSError:
+            pass
+
+
+def test_system_prompt_block():
+    with ProviderWithDB() as provider:
+        block = provider.system_prompt_block()
+        assert "Memory Enhancer Knowledge Base" in block
+        assert "memory_enhancer_search" in block
+
+
+def test_prefetch_with_content():
+    with ProviderWithDB() as provider:
+        provider._db.add_resource(
+            "memory://resources/research.md", "research.md",
+            "Important research about machine learning in psychiatry.",
+        )
+        result = provider.prefetch("machine learning psychiatry")
+        assert result  # Should return non-empty context
+        assert "Memory Enhancer Context" in result

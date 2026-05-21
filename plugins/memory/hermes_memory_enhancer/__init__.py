@@ -1,22 +1,21 @@
 """Hermes Memory Enhancer plugin — full bidirectional MemoryProvider interface.
 
-Self-hosted memory layer that organizes agent knowledge into a filesystem-like
-hierarchy (memory:// URIs) with tiered context loading, automatic memory
-extraction, and session management.
+SQLite-backed persistent memory layer that organizes agent knowledge into a
+filesystem-like hierarchy (memory:// URIs) with tiered context loading,
+automatic memory extraction, and session management — no external server required.
 
 Config via environment variables (profile-scoped via each profile's .env):
-  MEMORY_ENHANCER_ENDPOINT  — Server URL (default: http://127.0.0.1:1933)
-  MEMORY_ENHANCER_API_KEY   — API key (required for authenticated servers)
-  MEMORY_ENHANCER_ACCOUNT   — Tenant account (default: default)
-  MEMORY_ENHANCER_USER      — Tenant user (default: default)
-  MEMORY_ENHANCER_AGENT   — Tenant agent (default: hermes)
+  MEMORY_ENHANCER_DB_PATH  — SQLite database path (required)
+  MEMORY_ENHANCER_ACCOUNT  — Tenant account (default: default)
+  MEMORY_ENHANCER_USER     — Tenant user (default: default)
+  MEMORY_ENHANCER_AGENT    — Tenant agent (default: hermes)
 
 Capabilities:
-  - Automatic memory extraction on session commit (6 categories)
+  - Automatic memory extraction on session commit
   - Tiered context: L0 (~100 tokens), L1 (~2k), L2 (full)
-  - Semantic search with hierarchical directory retrieval
+  - Full-text search with hierarchical directory retrieval
   - Filesystem-style browsing via memory:// URIs
-  - Resource ingestion (URLs, docs, code)
+  - Resource ingestion (local files)
 """
 
 from __future__ import annotations
@@ -27,27 +26,22 @@ import logging
 import mimetypes
 import os
 import re
-import tempfile
+import sqlite3
 import threading
 import uuid
-import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
-from urllib.request import url2pathname
 
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_ENDPOINT = "http://127.0.0.1:1933"
-_TIMEOUT = 30.0
-_REMOTE_RESOURCE_PREFIXES = ("http://", "https://", "git@", "ssh://", "git://")
 _DEFAULT_PREFETCH_TOP_K = 3
 _DEFAULT_MAX_ABSTRACT_CHARS = 500
 _DEFAULT_SYNC_MAX_CHARS = 4000
-_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(api[_-]?key|token|secret|password|passwd|authorization)\s*[:=]\s*[^\s,;]+"),
     re.compile(r"(?i)(bearer\s+)[a-z0-9._~+/=-]{16,}"),
@@ -60,17 +54,13 @@ _SENSITIVE_PATH_PARTS = {
 }
 _SENSITIVE_NAME_HINTS = (".env", "secret", "token", "credential", "password", "passwd", "private_key")
 
-
 # ---------------------------------------------------------------------------
-# Process-level atexit safety net — ensures pending sessions are committed
-# even if shutdown_memory_provider is never called (e.g. gateway crash,
-# SIGKILL, or exception in the session expiry watcher preventing shutdown).
+# Process-level atexit safety net
 # ---------------------------------------------------------------------------
 _last_active_provider: Optional["HermesMemoryEnhancerProvider"] = None
 
 
 def _atexit_commit_sessions():
-    """Fire on_session_end for the last active provider on process exit."""
     global _last_active_provider
     provider = _last_active_provider
     if provider is None:
@@ -79,24 +69,15 @@ def _atexit_commit_sessions():
     try:
         provider.on_session_end([])
     except Exception:
-        pass  # best-effort at shutdown time
+        pass
 
 
 atexit.register(_atexit_commit_sessions)
 
 
 # ---------------------------------------------------------------------------
-# HTTP helper — uses httpx to avoid requiring the hermes_memory_enhancer SDK
+# Helpers
 # ---------------------------------------------------------------------------
-
-def _get_httpx():
-    """Lazy import httpx."""
-    try:
-        import httpx
-        return httpx
-    except ImportError:
-        return None
-
 
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
@@ -116,36 +97,15 @@ def _env_int(name: str, default: int, *, minimum: int = 0, maximum: int | None =
     return value
 
 
-def _endpoint_is_loopback(endpoint: str) -> bool:
-    parsed = urlparse(endpoint)
-    host = (parsed.hostname or "").lower()
-    return host in _LOOPBACK_HOSTS
-
-
-def _endpoint_security_error(endpoint: str, api_key: str) -> str:
-    parsed = urlparse(endpoint)
-    scheme = (parsed.scheme or "http").lower()
-    if _endpoint_is_loopback(endpoint):
-        return ""
-    if scheme != "https" and not _env_bool("MEMORY_ENHANCER_ALLOW_INSECURE_REMOTE", False):
-        return (
-            "Refusing Memory Enhancer remote non-HTTPS endpoint. Use https://, "
-            "127.0.0.1/localhost, or set MEMORY_ENHANCER_ALLOW_INSECURE_REMOTE=true."
-        )
-    if not api_key and not _env_bool("MEMORY_ENHANCER_ALLOW_UNAUTHENTICATED_REMOTE", False):
-        return (
-            "Refusing Memory Enhancer remote endpoint without API key. Set "
-            "MEMORY_ENHANCER_API_KEY or explicitly allow unauthenticated remote mode."
-        )
-    return ""
-
-
 def _redact_secrets(text: str) -> str:
     if not text:
         return text
     redacted = text
     for pattern in _SECRET_PATTERNS:
-        redacted = pattern.sub(lambda m: m.group(1) + " [REDACTED]" if m.groups() else "[REDACTED]", redacted)
+        redacted = pattern.sub(
+            lambda m: m.group(1) + " [REDACTED]" if m.groups() else "[REDACTED]",
+            redacted,
+        )
     return redacted
 
 
@@ -195,111 +155,495 @@ def _local_upload_security_error(path: Path) -> str:
         return f"Local resource path is outside MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS: {path}"
     return ""
 
-class _MemoryEnhancerClient:
 
-    """Thin HTTP client for the Memory Enhancer REST API."""
+def _is_remote_resource_source(value: str) -> bool:
+    return value.startswith(("http://", "https://", "git@", "ssh://", "git://"))
 
-    def __init__(self, endpoint: str, api_key: str = "",
-                 account: str = "", user: str = "", agent: str = ""):
-        self._endpoint = endpoint.rstrip("/")
-        self._api_key = api_key
-        self._account = account or os.environ.get("MEMORY_ENHANCER_ACCOUNT", "default")
-        self._user = user or os.environ.get("MEMORY_ENHANCER_USER", "default")
-        self._agent = agent or os.environ.get("MEMORY_ENHANCER_AGENT", "hermes")
-        self._httpx = _get_httpx()
-        if self._httpx is None:
-            raise ImportError("httpx is required for Memory Enhancer: pip install httpx")
 
-    def _headers(self) -> dict:
-        # Always send tenant headers when account/user are configured.
-        # Memory Enhancer uses tenant headers to isolate account/user/agent data.
-        h = {
-            "Content-Type": "application/json",
-            "X-Memory-Enhancer-Agent": self._agent,
-        }
-        if self._account:
-            h["X-Memory-Enhancer-Account"] = self._account
-        if self._user:
-            h["X-Memory-Enhancer-User"] = self._user
-        if self._api_key:
-            h["X-API-Key"] = self._api_key
-            h["Authorization"] = "Bearer " + self._api_key
-        return h
+def _is_windows_absolute_path(value: str) -> bool:
+    return (
+        len(value) >= 3
+        and value[0].isalpha()
+        and value[1] == ":"
+        and value[2] in ("/", "\\")
+    )
 
-    def _url(self, path: str) -> str:
-        return f"{self._endpoint}{path}"
 
-    def _multipart_headers(self) -> dict:
-        headers = self._headers()
-        headers.pop("Content-Type", None)
-        return headers
+def _is_local_path_reference(value: str) -> bool:
+    if not value or "\n" in value or "\r" in value:
+        return False
+    if _is_remote_resource_source(value):
+        return False
+    if _is_windows_absolute_path(value):
+        return True
+    return (
+        value.startswith(("/", "./", "../", "~/", ".\\", "..\\", "~\\"))
+        or "/" in value
+        or "\\" in value
+    )
 
-    def _parse_response(self, resp) -> dict:
+
+# ---------------------------------------------------------------------------
+# SQLite backend
+# ---------------------------------------------------------------------------
+
+_SQLITE_INIT = """
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA foreign_keys=ON;
+
+CREATE TABLE IF NOT EXISTS nodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uri TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    parent_uri TEXT NOT NULL DEFAULT '',
+    is_dir INTEGER NOT NULL DEFAULT 0,
+    content TEXT DEFAULT '',
+    abstract TEXT DEFAULT '',
+    overview TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_nodes_parent ON nodes(parent_uri);
+CREATE INDEX IF NOT EXISTS idx_nodes_uri ON nodes(uri);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
+    name, content, abstract, overview,
+    tokenize='porter unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS nodes_fts_ai AFTER INSERT ON nodes BEGIN
+    INSERT INTO nodes_fts(rowid, name, content, abstract, overview)
+    VALUES (new.id, new.name, new.content, new.abstract, new.overview);
+END;
+
+CREATE TRIGGER IF NOT EXISTS nodes_fts_ad AFTER DELETE ON nodes BEGIN
+    INSERT INTO nodes_fts(nodes_fts, rowid, name, content, abstract, overview)
+    VALUES ('delete', old.id, old.name, old.content, old.abstract, old.overview);
+END;
+
+CREATE TRIGGER IF NOT EXISTS nodes_fts_au AFTER UPDATE ON nodes BEGIN
+    INSERT INTO nodes_fts(nodes_fts, rowid, name, content, abstract, overview)
+    VALUES ('delete', old.id, old.name, old.content, old.abstract, old.overview);
+    INSERT INTO nodes_fts(rowid, name, content, abstract, overview)
+    VALUES (new.id, new.name, new.content, new.abstract, new.overview);
+END;
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    turn_count INTEGER NOT NULL DEFAULT 0,
+    committed INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    role TEXT NOT NULL,
+    content TEXT DEFAULT '',
+    parts_json TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+
+CREATE TABLE IF NOT EXISTS memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT REFERENCES sessions(id),
+    category TEXT NOT NULL DEFAULT 'general',
+    content TEXT NOT NULL,
+    score REAL NOT NULL DEFAULT 1.0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+    content, category,
+    tokenize='porter unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS memories_fts_ai AFTER INSERT ON memories BEGIN
+    INSERT INTO memories_fts(rowid, content, category)
+    VALUES (new.id, new.content, new.category);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memories_fts_ad AFTER DELETE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, content, category)
+    VALUES ('delete', old.id, old.content, old.category);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, content, category)
+    VALUES ('delete', old.id, old.content, old.category);
+    INSERT INTO memories_fts(rowid, content, category)
+    VALUES (new.id, new.content, new.category);
+END;
+
+CREATE TABLE IF NOT EXISTS resources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uri TEXT UNIQUE NOT NULL,
+    source_name TEXT DEFAULT '',
+    source_url TEXT DEFAULT '',
+    content TEXT DEFAULT '',
+    abstract TEXT DEFAULT '',
+    size INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
+_SQLITE_SEED_DIRS = """
+INSERT OR IGNORE INTO nodes (uri, name, parent_uri, is_dir) VALUES ('memory://', '', '', 1);
+INSERT OR IGNORE INTO nodes (uri, name, parent_uri, is_dir) VALUES ('memory://user', 'user', 'memory://', 1);
+INSERT OR IGNORE INTO nodes (uri, name, parent_uri, is_dir) VALUES ('memory://user/$AGENT', '$AGENT', 'memory://user', 1);
+INSERT OR IGNORE INTO nodes (uri, name, parent_uri, is_dir) VALUES ('memory://user/$AGENT/memories', 'memories', 'memory://user/$AGENT', 1);
+INSERT OR IGNORE INTO nodes (uri, name, parent_uri, is_dir) VALUES ('memory://user/$AGENT/skills', 'skills', 'memory://user/$AGENT', 1);
+INSERT OR IGNORE INTO nodes (uri, name, parent_uri, is_dir) VALUES ('memory://resources', 'resources', 'memory://', 1);
+"""
+
+
+class _MemoryEnhancerSQLite:
+    """Direct SQLite backend for Memory Enhancer — replaces the HTTP client."""
+
+    def __init__(self, db_path: str):
+        self._db_path = db_path
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._agent = os.environ.get("MEMORY_ENHANCER_AGENT", "hermes")
+        self._init_schema()
+
+    def _init_schema(self):
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.executescript(_SQLITE_INIT)
+            # Seed default directories, substituting agent name
+            for stmt in _SQLITE_SEED_DIRS.split(";"):
+                stmt = stmt.strip()
+                if not stmt:
+                    continue
+                sql = stmt.replace("$AGENT", self._agent)
+                cur.execute(sql)
+            self._conn.commit()
+
+    def close(self):
         try:
-            data = resp.json()
+            self._conn.close()
         except Exception:
-            data = None
-
-        if resp.status_code >= 400:
-            if isinstance(data, dict):
-                error = data.get("error")
-                if isinstance(error, dict):
-                    code = error.get("code", "HTTP_ERROR")
-                    message = error.get("message", resp.text)
-                    raise RuntimeError(f"{code}: {message}")
-                if data.get("status") == "error":
-                    raise RuntimeError(str(data))
-            resp.raise_for_status()
-
-        if isinstance(data, dict) and data.get("status") == "error":
-            error = data.get("error")
-            if isinstance(error, dict):
-                code = error.get("code", "MEMORY_ENHANCER_ERROR")
-                message = error.get("message", "")
-                raise RuntimeError(f"{code}: {message}")
-            raise RuntimeError(str(data))
-
-        if data is None:
-            return {}
-        return data
-
-    def get(self, path: str, **kwargs) -> dict:
-        resp = self._httpx.get(
-            self._url(path), headers=self._headers(), timeout=_TIMEOUT, **kwargs
-        )
-        return self._parse_response(resp)
-
-    def post(self, path: str, payload: dict = None, **kwargs) -> dict:
-        resp = self._httpx.post(
-            self._url(path), json=payload or {}, headers=self._headers(),
-            timeout=_TIMEOUT, **kwargs
-        )
-        return self._parse_response(resp)
-
-    def upload_temp_file(self, file_path: Path) -> str:
-        mime_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
-        with file_path.open("rb") as f:
-            resp = self._httpx.post(
-                self._url("/api/v1/resources/temp_upload"),
-                files={"file": (file_path.name, f, mime_type)},
-                headers=self._multipart_headers(),
-                timeout=_TIMEOUT,
-            )
-        data = self._parse_response(resp)
-        result = data.get("result", {})
-        temp_file_id = result.get("temp_file_id", "")
-        if not temp_file_id:
-            raise RuntimeError("Memory Enhancer temp upload did not return temp_file_id")
-        return temp_file_id
+            pass
 
     def health(self) -> bool:
         try:
-            resp = self._httpx.get(
-                self._url("/health"), headers=self._headers(), timeout=3.0
-            )
-            return resp.status_code == 200
+            cur = self._conn.execute("SELECT 1")
+            return cur.fetchone() is not None
         except Exception:
             return False
+
+    def _node_from_row(self, row: sqlite3.Row) -> dict:
+        return {
+            "uri": row["uri"],
+            "name": row["name"],
+            "isDir": bool(row["is_dir"]),
+            "type": "dir" if row["is_dir"] else "file",
+            "abstract": row["abstract"] or "",
+            "content": row["content"] or "",
+            "overview": row["overview"] or "",
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    # -- Filesystem operations -----------------------------------------------
+
+    def ls(self, uri: str) -> dict:
+        children = []
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM nodes WHERE parent_uri = ? ORDER BY is_dir DESC, name ASC",
+                (uri,),
+            )
+            for row in cur.fetchall():
+                children.append(self._node_from_row(row))
+        return {"entries": children}
+
+    def tree(self, uri: str) -> list:
+        """Recursive tree listing."""
+        result = []
+        with self._lock:
+            self._build_tree(uri, result, 0)
+        return result
+
+    def _build_tree(self, uri: str, result: list, depth: int):
+        cur = self._conn.execute(
+            "SELECT * FROM nodes WHERE parent_uri = ? ORDER BY is_dir DESC, name ASC",
+            (uri,),
+        )
+        for row in cur.fetchall():
+            node = self._node_from_row(row)
+            node["depth"] = depth
+            result.append(node)
+            if node["isDir"]:
+                self._build_tree(row["uri"], result, depth + 1)
+
+    def stat(self, uri: str) -> dict | None:
+        with self._lock:
+            cur = self._conn.execute("SELECT * FROM nodes WHERE uri = ?", (uri,))
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return self._node_from_row(row)
+
+    # -- Content operations --------------------------------------------------
+
+    def read(self, uri: str) -> str:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT content FROM nodes WHERE uri = ?", (uri,)
+            )
+            row = cur.fetchone()
+            return row["content"] if row else ""
+
+    def abstract(self, uri: str) -> str:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT abstract FROM nodes WHERE uri = ?", (uri,)
+            )
+            row = cur.fetchone()
+            return row["abstract"] if row else ""
+
+    def overview(self, uri: str) -> str:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT overview FROM nodes WHERE uri = ?", (uri,)
+            )
+            row = cur.fetchone()
+            return row["overview"] if row else ""
+
+    # -- Search --------------------------------------------------------------
+
+    def search(self, query: str, top_k: int = 10, scope: str = "") -> dict:
+        """Full-text search across nodes and memories."""
+        memories = []
+        resources = []
+        skills = []
+
+        scope_filter = ""
+        params: list = [query]
+        if scope:
+            scope_filter = " AND uri LIKE ?"
+            params.append(scope + "%")
+
+        with self._lock:
+            try:
+                cur = self._conn.execute(
+                    f"SELECT n.*, rank FROM nodes_fts f JOIN nodes n ON f.rowid = n.id "
+                    f"WHERE nodes_fts MATCH ?{scope_filter} ORDER BY rank LIMIT ?",
+                    params + [top_k],
+                )
+                for row in cur.fetchall():
+                    node = self._node_from_row(row)
+                    node["score"] = 1.0 / (1.0 + abs(row["rank"])) if row["rank"] else 1.0
+                    uri = node["uri"]
+                    if uri.startswith("memory://resources"):
+                        resources.append(node)
+                    elif uri.startswith("memory://user"):
+                        if "/skills/" in uri:
+                            skills.append(node)
+                        else:
+                            memories.append(node)
+                    else:
+                        memories.append(node)
+            except sqlite3.OperationalError:
+                pass  # FTS query syntax error — return empty
+
+        try:
+            cur = self._conn.execute(
+                "SELECT m.*, rank FROM memories_fts f JOIN memories m ON f.rowid = m.id "
+                "WHERE memories_fts MATCH ? ORDER BY rank LIMIT ?",
+                [query, top_k],
+            )
+            for row in cur.fetchall():
+                entry = {
+                    "uri": f"memory://user/{self._agent}/memories/{row['id']}",
+                    "score": 1.0 / (1.0 + abs(row["rank"])) if row["rank"] else 1.0,
+                    "abstract": _truncate(row["content"], _DEFAULT_MAX_ABSTRACT_CHARS),
+                    "type": "memory",
+                    "category": row["category"],
+                }
+                memories.append(entry)
+        except sqlite3.OperationalError:
+            pass
+
+        return {
+            "memories": memories[:top_k],
+            "resources": resources[:top_k],
+            "skills": skills[:top_k],
+            "total": len(memories) + len(resources) + len(skills),
+        }
+
+    # -- Session management --------------------------------------------------
+
+    def ensure_session(self, session_id: str):
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO sessions (id) VALUES (?)",
+                (session_id,),
+            )
+            self._conn.commit()
+
+    def add_message(self, session_id: str, role: str, content: str = "",
+                    parts: list | None = None):
+        parts_json_str = json.dumps(parts, ensure_ascii=False) if parts else ""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO messages (session_id, role, content, parts_json) VALUES (?, ?, ?, ?)",
+                (session_id, role, content, parts_json_str),
+            )
+            self._conn.commit()
+
+    def increment_turn_count(self, session_id: str):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE sessions SET turn_count = turn_count + 1 WHERE id = ?",
+                (session_id,),
+            )
+            self._conn.commit()
+
+    def commit_session(self, session_id: str) -> int:
+        """Commit session and extract [Remember] messages as memories.
+        Returns the number of messages processed."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT turn_count FROM sessions WHERE id = ?", (session_id,)
+            )
+            row = cur.fetchone()
+            if row is None:
+                return 0
+            turn_count = row["turn_count"]
+            if turn_count == 0:
+                return 0
+
+            # Extract [Remember] messages as explicit memories
+            cur = self._conn.execute(
+                "SELECT content FROM messages WHERE session_id = ? AND role = 'user' AND content LIKE '[Remember%'",
+                (session_id,),
+            )
+            extracted = 0
+            for msg_row in cur.fetchall():
+                text = msg_row["content"]
+                category = "general"
+                content_text = text
+                if text.startswith("[Remember — "):
+                    end_bracket = text.find("]")
+                    if end_bracket > 0:
+                        category = text[12:end_bracket].strip().lower()
+                        content_text = text[end_bracket + 1:].strip()
+                elif text.startswith("[Remember]"):
+                    content_text = text[10:].strip()
+                elif text.startswith("[Remember"):
+                    rest = text[9:].strip()
+                    if rest.startswith("— "):
+                        end_bracket = rest.find("]")
+                        if end_bracket > 0:
+                            category = rest[2:end_bracket].strip().lower()
+                            content_text = rest[end_bracket + 1:].strip()
+
+                if content_text:
+                    self._conn.execute(
+                        "INSERT INTO memories (session_id, category, content) VALUES (?, ?, ?)",
+                        (session_id, category, content_text),
+                    )
+                    extracted += 1
+
+            self._conn.execute(
+                "UPDATE sessions SET committed = 1 WHERE id = ?",
+                (session_id,),
+            )
+            self._conn.commit()
+            return turn_count
+
+    def get_messages(self, session_id: str) -> List[dict]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM messages WHERE session_id = ? ORDER BY id ASC",
+                (session_id,),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+    def get_session_messages_text(self, session_id: str, max_chars: int) -> str:
+        """Get session messages as concatenated text for prefetch context."""
+        messages = self.get_messages(session_id)
+        parts = []
+        remaining = max_chars
+        for msg in messages:
+            text = msg["content"]
+            if not text:
+                continue
+            line = f"[{msg['role']}] {_redact_secrets(text)}"
+            if len(line) > remaining:
+                line = _truncate(line, remaining)
+            parts.append(line)
+            remaining -= len(line) + 1
+            if remaining <= 0:
+                break
+        return "\n".join(parts)
+
+    # -- Memory operations ---------------------------------------------------
+
+    def store_memory(self, content: str, category: str, session_id: str):
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO memories (session_id, category, content) VALUES (?, ?, ?)",
+                (session_id, category, content),
+            )
+            self._conn.commit()
+
+    def get_recent_memories(self, limit: int = 10) -> List[dict]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM memories ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+    # -- Resource operations -------------------------------------------------
+
+    def add_resource(self, uri: str, source_name: str, content: str,
+                     abstract: str = "", source_url: str = "") -> str:
+        # Auto-create parent directory nodes
+        parts = uri.rstrip("/").split("/")
+        path_segments: list[str] = []
+        for part in parts[:-1]:
+            if not part or part == "memory:":
+                continue  # Skip empty parts and "memory:" scheme
+            path_segments.append(part)
+            parent_path = f"memory://{'/'.join(path_segments[:-1])}" if len(path_segments) > 1 else "memory://"
+            current_path = f"memory://{'/'.join(path_segments)}"
+            with self._lock:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO nodes (uri, name, parent_uri, is_dir) VALUES (?, ?, ?, 1)",
+                    (current_path, part, parent_path),
+                )
+
+        name = parts[-1] if parts else source_name
+        parent_uri = f"memory://{'/'.join(path_segments)}" if path_segments else "memory://"
+        abstract_text = abstract or _truncate(content, _DEFAULT_MAX_ABSTRACT_CHARS)
+        overview_text = abstract_text
+
+        with self._lock:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO nodes
+                   (uri, name, parent_uri, is_dir, content, abstract, overview)
+                   VALUES (?, ?, ?, 0, ?, ?, ?)""",
+                (uri, name, parent_uri, content, abstract_text, overview_text),
+            )
+            self._conn.execute(
+                """INSERT OR REPLACE INTO resources
+                   (uri, source_name, content, abstract, size, source_url)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (uri, source_name, content, abstract_text, len(content), source_url),
+            )
+            self._conn.commit()
+
+        return uri
 
 
 # ---------------------------------------------------------------------------
@@ -402,15 +746,15 @@ REMEMBER_SCHEMA = {
 ADD_RESOURCE_SCHEMA = {
     "name": "memory_enhancer_add_resource",
     "description": (
-        "Add a remote URL or explicitly allowed local file/directory to the Memory Enhancer knowledge base. "
+        "Add a local file to the Memory Enhancer knowledge base. "
         "Disabled by default; requires MEMORY_ENHANCER_ENABLE_ADD_RESOURCE=true. "
-        "Local uploads also require MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS and sensitive paths are refused. "
+        "Also requires MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS. "
         "The system automatically parses, indexes, and generates summaries."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "url": {"type": "string", "description": "Remote URL or local file/directory path to add."},
+            "url": {"type": "string", "description": "Local file path to add."},
             "reason": {
                 "type": "string",
                 "description": "Why this resource is relevant (improves search).",
@@ -423,76 +767,10 @@ ADD_RESOURCE_SCHEMA = {
                 "type": "string",
                 "description": "Optional parent memory:// URI. Cannot be used with to.",
             },
-            "instruction": {
-                "type": "string",
-                "description": "Optional processing instruction for semantic extraction.",
-            },
-            "wait": {
-                "type": "boolean",
-                "description": "Whether to wait for processing to complete.",
-            },
-            "timeout": {
-                "type": "number",
-                "description": "Timeout in seconds when wait is true.",
-            },
         },
         "required": ["url"],
     },
 }
-
-
-def _zip_directory(dir_path: Path) -> Path:
-    """Create a temporary zip file containing a directory tree."""
-    root = dir_path.resolve()
-    zip_path = Path(tempfile.gettempdir()) / f"hermes_memory_enhancer_upload_{uuid.uuid4().hex}.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for file_path in dir_path.rglob("*"):
-            if file_path.is_symlink():
-                continue
-            if file_path.is_file():
-                try:
-                    file_path.resolve().relative_to(root)
-                except ValueError:
-                    continue
-                if _local_upload_security_error(file_path):
-                    continue
-                arcname = str(file_path.relative_to(dir_path)).replace("\\", "/")
-                zipf.write(file_path, arcname=arcname)
-    return zip_path
-
-
-def _is_windows_absolute_path(value: str) -> bool:
-    return (
-        len(value) >= 3
-        and value[0].isalpha()
-        and value[1] == ":"
-        and value[2] in ("/", "\\")
-    )
-
-
-def _is_remote_resource_source(value: str) -> bool:
-    return value.startswith(_REMOTE_RESOURCE_PREFIXES)
-
-
-def _is_local_path_reference(value: str) -> bool:
-    if not value or "\n" in value or "\r" in value:
-        return False
-    if _is_remote_resource_source(value):
-        return False
-    if _is_windows_absolute_path(value):
-        return True
-    return (
-        value.startswith(("/", "./", "../", "~/", ".\\", "..\\", "~\\"))
-        or "/" in value
-        or "\\" in value
-    )
-
-
-def _path_from_file_uri(uri: str) -> Path | str:
-    parsed = urlparse(uri)
-    if parsed.netloc not in ("", "localhost"):
-        return f"Unsupported non-local file URI: {uri}"
-    return Path(url2pathname(parsed.path)).expanduser()
 
 
 # ---------------------------------------------------------------------------
@@ -500,12 +778,11 @@ def _path_from_file_uri(uri: str) -> Path | str:
 # ---------------------------------------------------------------------------
 
 class HermesMemoryEnhancerProvider(MemoryProvider):
-    """Full bidirectional memory via Memory Enhancer context database."""
+    """Full bidirectional memory via SQLite-backed knowledge store."""
 
     def __init__(self):
-        self._client: Optional[_MemoryEnhancerClient] = None
-        self._endpoint = ""
-        self._api_key = ""
+        self._db: Optional[_MemoryEnhancerSQLite] = None
+        self._db_path = ""
         self._session_id = ""
         self._turn_count = 0
         self._sync_thread: Optional[threading.Thread] = None
@@ -523,47 +800,42 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
         return "hermes_memory_enhancer"
 
     def is_available(self) -> bool:
-        """Check if Memory Enhancer endpoint is configured. No network calls."""
-        return bool(os.environ.get("MEMORY_ENHANCER_ENDPOINT"))
+        return bool(os.environ.get("MEMORY_ENHANCER_DB_PATH"))
 
     def get_config_schema(self):
         return [
             {
-                "key": "endpoint",
-                "description": "Memory Enhancer server URL",
+                "key": "db_path",
+                "description": "Path to SQLite database file",
                 "required": True,
-                "default": _DEFAULT_ENDPOINT,
-                "env_var": "MEMORY_ENHANCER_ENDPOINT",
-            },
-            {
-                "key": "api_key",
-                "description": "Memory Enhancer API key (leave blank for local dev mode)",
-                "secret": True,
-                "env_var": "MEMORY_ENHANCER_API_KEY",
+                "default": "$HOME/.hermes/memory_enhancer/memory.sqlite3",
+                "env_var": "MEMORY_ENHANCER_DB_PATH",
             },
             {
                 "key": "account",
-                "description": "Memory Enhancer tenant account ID ([default], used when local mode, MEMORY_ENHANCER_API_KEY is empty)",
+                "description": "Memory Enhancer tenant account ID",
                 "default": "default",
                 "env_var": "MEMORY_ENHANCER_ACCOUNT",
             },
             {
                 "key": "user",
-                "description": "Memory Enhancer user ID within the account ([default], used when local mode, MEMORY_ENHANCER_API_KEY is empty)",
+                "description": "Memory Enhancer user ID within the account",
                 "default": "default",
                 "env_var": "MEMORY_ENHANCER_USER",
             },
             {
                 "key": "agent",
-                "description": "Memory Enhancer agent ID within the account ([hermes], useful in multi-agent mode)",
+                "description": "Memory Enhancer agent ID within the account",
                 "default": "hermes",
                 "env_var": "MEMORY_ENHANCER_AGENT",
             },
         ]
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        self._endpoint = os.environ.get("MEMORY_ENHANCER_ENDPOINT", _DEFAULT_ENDPOINT)
-        self._api_key = os.environ.get("MEMORY_ENHANCER_API_KEY", "")
+        self._db_path = os.environ.get(
+            "MEMORY_ENHANCER_DB_PATH",
+            str(Path.home() / ".hermes" / "memory_enhancer" / "memory.sqlite3"),
+        )
         self._account = os.environ.get("MEMORY_ENHANCER_ACCOUNT", "default")
         self._user = os.environ.get("MEMORY_ENHANCER_USER", "default")
         self._agent = os.environ.get("MEMORY_ENHANCER_AGENT", "hermes")
@@ -575,42 +847,32 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
         self._redact_secrets = _env_bool("MEMORY_ENHANCER_REDACT_SECRETS", True)
         self._enable_add_resource = _env_bool("MEMORY_ENHANCER_ENABLE_ADD_RESOURCE", False)
 
-        security_error = _endpoint_security_error(self._endpoint, self._api_key)
-        if security_error:
-            logger.warning("%s", security_error)
-            self._client = None
-            return
-
         try:
-            self._client = _MemoryEnhancerClient(
-                self._endpoint, self._api_key,
-                account=self._account, user=self._user, agent=self._agent,
-            )
-            if not self._client.health():
-                logger.warning("Memory Enhancer server at %s is not reachable", self._endpoint)
-                self._client = None
-        except ImportError:
-            logger.warning("httpx not installed — Memory Enhancer plugin disabled")
-            self._client = None
+            Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
+            self._db = _MemoryEnhancerSQLite(self._db_path)
+            if not self._db.health():
+                logger.warning("Memory Enhancer database at %s is not accessible", self._db_path)
+                self._db = None
+        except Exception as e:
+            logger.warning("Memory Enhancer failed to initialize: %s", e)
+            self._db = None
 
         # Register as the last active provider for atexit safety net
         global _last_active_provider
         _last_active_provider = self
 
     def system_prompt_block(self) -> str:
-        if not self._client:
+        if not self._db:
             return ""
-        # Provide brief info about the knowledge base
         try:
-            # Check what's in the knowledge base via a root listing
-            resp = self._client.get("/api/v1/fs/ls", params={"uri": "memory://"})
-            result = resp.get("result", [])
-            children = len(result) if isinstance(result, list) else 0
+            result = self._db.ls("memory://")
+            entries = result.get("entries", []) if isinstance(result, dict) else []
+            children = len(entries)
             if children == 0:
                 return ""
             return (
                 "# Memory Enhancer Knowledge Base\n"
-                f"Active. Endpoint: {self._endpoint}\n"
+                f"Active. Database: {self._db_path}\n"
                 "Use memory_enhancer_search to find information, memory_enhancer_read for details "
                 "(abstract/overview/full), memory_enhancer_browse to explore.\n"
                 "Use memory_enhancer_remember to store durable facts. "
@@ -620,13 +882,12 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
             logger.warning("Memory Enhancer system_prompt_block failed: %s", e)
             return (
                 "# Memory Enhancer Knowledge Base\n"
-                f"Active. Endpoint: {self._endpoint}\n"
+                f"Active. Database: {self._db_path}\n"
                 "Use memory_enhancer_search, memory_enhancer_read, memory_enhancer_browse, "
                 "memory_enhancer_remember. memory_enhancer_add_resource is disabled unless explicitly enabled."
             )
 
     def _format_prefetch_result(self, result: Dict[str, Any]) -> str:
-        """Format search results for automatic prompt injection."""
         parts = []
         remaining = self._sync_max_chars
         for ctx_type in ("memories", "resources", "skills"):
@@ -660,25 +921,16 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
         return _truncate(query, self._sync_max_chars)
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Return relevant Memory Enhancer context for the current turn.
-
-        Prefer the background result queued after the previous turn, but fall
-        back to a bounded synchronous search so the first turn of a new session
-        also gets relevant context instead of waiting until turn two.
-        """
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=3.0)
         with self._prefetch_lock:
             result = self._prefetch_result
             self._prefetch_result = ""
-        if not result and self._client and query:
+        if not result and self._db and query:
             try:
                 sanitized_query = self._sanitize_prefetch_query(query)
-                resp = self._client.post("/api/v1/search/find", {
-                    "query": sanitized_query,
-                    "top_k": self._prefetch_top_k,
-                })
-                result = self._format_prefetch_result(resp.get("result", {}))
+                resp = self._db.search(sanitized_query, top_k=self._prefetch_top_k)
+                result = self._format_prefetch_result(resp)
             except Exception as e:
                 logger.debug("Memory Enhancer synchronous prefetch failed: %s", e)
                 result = ""
@@ -687,27 +939,22 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
         return f"## Memory Enhancer Context\n{result}"
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        """Fire a background search to pre-load relevant context."""
-        if not self._client or not query:
+        if not self._db or not query:
             return
 
         def _run():
             try:
-                client = _MemoryEnhancerClient(
-                    self._endpoint, self._api_key,
-                    account=self._account, user=self._user, agent=self._agent,
-                )
+                db = _MemoryEnhancerSQLite(self._db_path)
                 sanitized_query = self._sanitize_prefetch_query(query)
-                resp = client.post("/api/v1/search/find", {
-                    "query": sanitized_query,
-                    "top_k": self._prefetch_top_k,
-                })
-                formatted = self._format_prefetch_result(resp.get("result", {}))
+                resp = db.search(sanitized_query, top_k=self._prefetch_top_k)
+                formatted = self._format_prefetch_result(resp)
                 if formatted:
                     with self._prefetch_lock:
                         self._prefetch_result = formatted
             except Exception as e:
                 logger.debug("Memory Enhancer prefetch failed: %s", e)
+            finally:
+                db.close()
 
         self._prefetch_thread = threading.Thread(
             target=_run, daemon=True, name="hermes_memory_enhancer-prefetch"
@@ -715,19 +962,16 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
         self._prefetch_thread.start()
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        """Record the conversation turn in Memory Enhancer's session (non-blocking)."""
-        if not self._client:
+        if not self._db:
             return
 
+        sid = self._session_id
+        self._db.ensure_session(sid)
         self._turn_count += 1
 
         def _sync():
             try:
-                client = _MemoryEnhancerClient(
-                    self._endpoint, self._api_key,
-                    account=self._account, user=self._user, agent=self._agent,
-                )
-                sid = self._session_id
+                db = _MemoryEnhancerSQLite(self._db_path)
 
                 user_text = user_content
                 assistant_text = assistant_content
@@ -737,20 +981,14 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
                 user_text = _truncate(user_text, self._sync_max_chars)
                 assistant_text = _truncate(assistant_text, self._sync_max_chars)
 
-                # Add user message
-                client.post(f"/api/v1/sessions/{sid}/messages", {
-                    "role": "user",
-                    "content": user_text,
-                })
-                # Add assistant message
-                client.post(f"/api/v1/sessions/{sid}/messages", {
-                    "role": "assistant",
-                    "content": assistant_text,
-                })
+                db.add_message(sid, "user", user_text)
+                db.add_message(sid, "assistant", assistant_text)
+                db.increment_turn_count(sid)
             except Exception as e:
                 logger.debug("Memory Enhancer sync_turn failed: %s", e)
+            finally:
+                db.close()
 
-        # Wait for any previous sync to finish before starting a new one
         if self._sync_thread and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=5.0)
 
@@ -760,17 +998,9 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
         self._sync_thread.start()
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        """Commit the session to trigger memory extraction.
-
-        Memory Enhancer automatically extracts 6 categories of memories:
-        profile, preferences, entities, events, cases, and patterns.
-        """
-        if not self._client:
+        if not self._db:
             return
 
-        # Wait for any pending sync to finish first — do this before the
-        # turn_count check so the last turn's messages are flushed even if
-        # the count hasn't been incremented yet.
         if self._sync_thread and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=10.0)
 
@@ -778,36 +1008,34 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
             return
 
         try:
-            self._client.post(f"/api/v1/sessions/{self._session_id}/commit")
-            logger.info("Memory Enhancer session %s committed (%d turns)", self._session_id, self._turn_count)
+            turn_count = self._db.commit_session(self._session_id)
+            logger.info(
+                "Memory Enhancer session %s committed (%d turns)",
+                self._session_id, turn_count,
+            )
         except Exception as e:
             logger.warning("Memory Enhancer session commit failed: %s", e)
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
-        """Mirror built-in memory writes to Memory Enhancer as explicit memories."""
-        if not self._client or action != "add" or not content:
+        if not self._db or action != "add" or not content:
             return
 
         def _write():
             try:
-                client = _MemoryEnhancerClient(
-                    self._endpoint, self._api_key,
-                    account=self._account, user=self._user, agent=self._agent,
-                )
+                db = _MemoryEnhancerSQLite(self._db_path)
                 memory_content = content
                 if self._redact_secrets:
                     memory_content = _redact_secrets(memory_content)
                 memory_content = _truncate(memory_content, self._sync_max_chars)
-                # Add as a user message with memory context so the commit
-                # picks it up as an explicit memory during extraction
-                client.post(f"/api/v1/sessions/{self._session_id}/messages", {
-                    "role": "user",
-                    "parts": [
-                        {"type": "text", "text": f"[Memory note — {target}] {memory_content}"},
-                    ],
-                })
+                db.ensure_session(self._session_id)
+                db.add_message(
+                    self._session_id, "user",
+                    f"[Memory note — {target}] {memory_content}",
+                )
             except Exception as e:
                 logger.debug("Memory Enhancer memory mirror failed: %s", e)
+            finally:
+                db.close()
 
         t = threading.Thread(target=_write, daemon=True, name="hermes_memory_enhancer-memwrite")
         t.start()
@@ -816,8 +1044,8 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
         return [SEARCH_SCHEMA, READ_SCHEMA, BROWSE_SCHEMA, REMEMBER_SCHEMA, ADD_RESOURCE_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
-        if not self._client:
-            return tool_error("Memory Enhancer server not connected")
+        if not self._db:
+            return tool_error("Memory Enhancer database not connected")
 
         try:
             if tool_name == "memory_enhancer_search":
@@ -835,11 +1063,14 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
             return tool_error(str(e))
 
     def shutdown(self) -> None:
-        # Wait for background threads to finish
         for t in (self._sync_thread, self._prefetch_thread):
             if t and t.is_alive():
                 t.join(timeout=5.0)
-        # Clear atexit reference so it doesn't double-commit
+        if self._db:
+            try:
+                self._db.close()
+            except Exception:
+                pass
         global _last_active_provider
         if _last_active_provider is self:
             _last_active_provider = None
@@ -847,15 +1078,7 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
     # -- Tool implementations ------------------------------------------------
 
     @staticmethod
-    def _unwrap_result(resp: Any) -> Any:
-        """Return Memory Enhancer payload body regardless of wrapped/unwrapped shape."""
-        if isinstance(resp, dict) and "result" in resp:
-            return resp.get("result")
-        return resp
-
-    @staticmethod
     def _normalize_summary_uri(uri: str) -> str:
-        """Map pseudo summary files to their parent directory URI for L0/L1 reads."""
         if not uri:
             return uri
         for suffix in ("/.abstract.md", "/.overview.md", "/.read.md", "/.full.md"):
@@ -864,27 +1087,13 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
         return uri
 
     def _is_directory_uri(self, uri: str) -> bool | None:
-        """Probe fs/stat to decide if a URI is a directory.
-
-        Returns True/False when the server answers cleanly, and None when the
-        probe itself fails (network error, unexpected shape). Callers should
-        treat None as "unknown" and fall back to the exception-based path.
-        """
         try:
-            resp = self._client.get("/api/v1/fs/stat", params={"uri": uri})
+            node = self._db.stat(uri)
+            if node is None:
+                return None
+            return node.get("isDir", False)
         except Exception:
             return None
-        result = self._unwrap_result(resp)
-        if isinstance(result, dict):
-            if "isDir" in result:
-                return bool(result.get("isDir"))
-            if "is_dir" in result:
-                return bool(result.get("is_dir"))
-            if result.get("type") == "dir":
-                return True
-            if result.get("type") == "file":
-                return False
-        return None
 
     def _tool_search(self, args: dict) -> str:
         query = args.get("query", "")
@@ -893,22 +1102,14 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
         if self._redact_secrets:
             query = _redact_secrets(query)
 
-        payload: Dict[str, Any] = {"query": query}
-        mode = args.get("mode", "auto")
-        if mode != "auto":
-            payload["mode"] = mode
-        if args.get("scope"):
-            payload["target_uri"] = args["scope"]
-        if args.get("limit"):
-            payload["top_k"] = args["limit"]
+        top_k = args.get("limit", 10)
+        scope = args.get("scope", "")
 
-        resp = self._client.post("/api/v1/search/find", payload)
-        result = resp.get("result", {})
+        resp = self._db.search(query, top_k=top_k, scope=scope)
 
-        # Format results for the model — keep it concise
         scored_entries = []
         for ctx_type in ("memories", "resources", "skills"):
-            items = result.get(ctx_type, [])
+            items = resp.get(ctx_type, [])
             for item in items:
                 raw_score = item.get("score")
                 sort_score = raw_score if raw_score is not None else 0.0
@@ -922,8 +1123,6 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
                     "score": round(raw_score, 3) if raw_score is not None else 0.0,
                     "abstract": abstract,
                 }
-                if item.get("relations"):
-                    entry["related"] = [r.get("uri") for r in item["relations"][:3]]
                 scored_entries.append((sort_score, entry))
 
         scored_entries.sort(key=lambda x: x[0], reverse=True)
@@ -931,7 +1130,7 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
 
         return json.dumps({
             "results": formatted,
-            "total": result.get("total", len(formatted)),
+            "total": resp.get("total", len(formatted)),
         }, ensure_ascii=False)
 
     def _tool_read(self, args: dict) -> str:
@@ -942,51 +1141,34 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
         level = args.get("level", "overview")
 
         summary_level = level in ("abstract", "overview")
-        # Memory Enhancer expects directory URIs for pseudo summary files
-        # (e.g. memory://user/hermes/.overview.md).
         resolved_uri = self._normalize_summary_uri(uri) if summary_level else uri
         used_fallback = False
 
-        # abstract/overview endpoints are directory-only on Memory Enhancer
-        # (v0.3.x returns 500/412 for file URIs). When the caller asks for a
-        # summary level on a non-pseudo URI, probe fs/stat first and route
-        # file URIs straight to /content/read instead of eating a failing
-        # round-trip. The pseudo-URI path already points at a directory, so
-        # skip the probe there.
         if summary_level and resolved_uri == uri:
             is_dir = self._is_directory_uri(uri)
             if is_dir is False:
                 resolved_uri = uri
                 used_fallback = True
 
-        # Map our level names to Memory Enhancer GET endpoints.
-        endpoint = "/api/v1/content/read"
-        if not used_fallback:
-            if level == "abstract":
-                endpoint = "/api/v1/content/abstract"
-            elif level == "overview":
-                endpoint = "/api/v1/content/overview"
-
         try:
-            resp = self._client.get(endpoint, params={"uri": resolved_uri})
+            if level == "abstract":
+                content = self._db.abstract(resolved_uri)
+            elif level == "overview":
+                content = self._db.overview(resolved_uri)
+            else:
+                content = self._db.read(resolved_uri)
         except Exception:
-            # Memory Enhancer may return HTTP 500 for abstract/overview reads on normal
-            # file URIs (mem_*.md). For those, gracefully fallback to full read.
             if not summary_level or resolved_uri != uri or used_fallback:
                 raise
-            resp = self._client.get("/api/v1/content/read", params={"uri": uri})
+            content = self._db.read(uri)
             used_fallback = True
 
-        result = self._unwrap_result(resp)
-        # Content endpoints may return either plain strings or objects.
-        if isinstance(result, str):
-            content = result
-        elif isinstance(result, dict):
-            content = result.get("content", "") or result.get("text", "")
-        else:
-            content = ""
+        if not content:
+            # Fallback: try full read if summary returned empty
+            if summary_level and not used_fallback:
+                content = self._db.read(resolved_uri)
+                used_fallback = True
 
-        # Truncate long content to avoid flooding context.
         max_len = 8000
         if level == "overview":
             max_len = 4000
@@ -1013,37 +1195,56 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
         action = args.get("action", "list")
         path = args.get("path", "memory://")
 
-        # Map action to the correct fs endpoint (all GET with uri= param)
-        endpoint_map = {"tree": "/api/v1/fs/tree", "list": "/api/v1/fs/ls", "stat": "/api/v1/fs/stat"}
-        endpoint = endpoint_map.get(action, "/api/v1/fs/ls")
-        resp = self._client.get(endpoint, params={"uri": path})
-        result = self._unwrap_result(resp)
-
-        # Format list/tree results for readability
-        if action in ("list", "tree"):
-            raw_entries = result
-            if isinstance(result, dict):
-                raw_entries = result.get("entries") or result.get("items") or result.get("children") or []
-
-            if isinstance(raw_entries, list):
+        try:
+            if action == "tree":
+                result = self._db.tree(path)
+                # Format for readability
                 entries = []
-                for e in raw_entries[:50]:  # cap at 50 entries
-                    uri = e.get("uri", "")
-                    name = e.get("rel_path") or e.get("name") or (uri.rsplit("/", 1)[-1] if uri else "")
-                    is_dir = bool(e.get("isDir") or e.get("is_dir") or e.get("type") == "dir")
-                    abstract = e.get("abstract", "")
-                    if self._redact_secrets:
-                        abstract = _redact_secrets(abstract)
-                    abstract = _truncate(abstract, self._max_abstract_chars)
+                for node in result[:50]:
                     entries.append({
-                        "name": name,
-                        "uri": uri,
-                        "type": "dir" if is_dir else "file",
-                        "abstract": abstract,
+                        "name": node.get("name", ""),
+                        "uri": node.get("uri", ""),
+                        "type": "dir" if node.get("isDir") else "file",
+                        "depth": node.get("depth", 0),
+                        "abstract": _truncate(
+                            _redact_secrets(node.get("abstract", ""))
+                            if self._redact_secrets else node.get("abstract", ""),
+                            self._max_abstract_chars,
+                        ),
                     })
                 return json.dumps({"path": path, "entries": entries}, ensure_ascii=False)
 
-        return json.dumps(result, ensure_ascii=False)
+            elif action == "stat":
+                node = self._db.stat(path)
+                if node is None:
+                    return json.dumps({"error": f"URI not found: {path}"}, ensure_ascii=False)
+                return json.dumps({
+                    "uri": node["uri"],
+                    "name": node["name"],
+                    "type": "dir" if node["isDir"] else "file",
+                    "abstract": node.get("abstract", ""),
+                    "created_at": node.get("created_at", ""),
+                    "updated_at": node.get("updated_at", ""),
+                }, ensure_ascii=False)
+
+            else:  # list
+                result = self._db.ls(path)
+                raw_entries = result.get("entries", [])
+                entries = []
+                for e in raw_entries[:50]:
+                    abstract = e.get("abstract", "")
+                    if self._redact_secrets:
+                        abstract = _redact_secrets(abstract)
+                    entries.append({
+                        "name": e.get("name", ""),
+                        "uri": e.get("uri", ""),
+                        "type": "dir" if e.get("isDir") else "file",
+                        "abstract": _truncate(abstract, self._max_abstract_chars),
+                    })
+                return json.dumps({"path": path, "entries": entries}, ensure_ascii=False)
+
+        except Exception as e:
+            return tool_error(str(e))
 
     def _tool_remember(self, args: dict) -> str:
         content = args.get("content", "")
@@ -1053,19 +1254,16 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
             content = _redact_secrets(content)
         content = _truncate(content, self._sync_max_chars)
 
-        # Store as a session message that will be extracted during commit.
-        # The category hint helps Memory Enhancer's extraction classify correctly.
-        category = args.get("category", "")
+        category = args.get("category", "general")
+
+        self._db.ensure_session(self._session_id)
+        # Store as message for commit extraction
         text = f"[Remember] {content}"
         if category:
             text = f"[Remember — {category}] {content}"
-
-        self._client.post(f"/api/v1/sessions/{self._session_id}/messages", {
-            "role": "user",
-            "parts": [
-                {"type": "text", "text": text},
-            ],
-        })
+        self._db.add_message(self._session_id, "user", text)
+        # Also store directly as a memory
+        self._db.store_memory(content, category, self._session_id)
 
         return json.dumps({
             "status": "stored",
@@ -1086,57 +1284,53 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
         if args.get("to") and args.get("parent"):
             return tool_error("Cannot specify both 'to' and 'parent'")
 
-        payload: Dict[str, Any] = {}
-        for key in ("reason", "to", "parent", "instruction", "wait", "timeout"):
-            if key in args and args[key] not in (None, ""):
-                payload[key] = args[key]
-
         parsed_url = urlparse(url)
+
         if _is_remote_resource_source(url):
-            source_path = None
-        elif parsed_url.scheme == "file":
-            source_path = _path_from_file_uri(url)
-            if isinstance(source_path, str):
-                return tool_error(source_path)
-        elif parsed_url.scheme and not _is_windows_absolute_path(url):
-            source_path = None
-        else:
-            source_path = Path(url).expanduser()
+            return tool_error(
+                "Remote URL resources are not supported in direct SQLite mode. "
+                "Use a local file path instead."
+            )
 
-        cleanup_path: Optional[Path] = None
+        source_path = Path(url).expanduser()
+
+        local_security_error = _local_upload_security_error(source_path)
+        if local_security_error:
+            return tool_error(local_security_error)
+
+        if not source_path.exists():
+            return tool_error(f"Local resource path does not exist: {url}")
+
         try:
-            if source_path is not None:
-                local_security_error = _local_upload_security_error(source_path)
-                if local_security_error:
-                    return tool_error(local_security_error)
-                if source_path.exists():
-                    if source_path.is_dir():
-                        payload["source_name"] = source_path.name
-                        cleanup_path = _zip_directory(source_path)
-                        upload_path = cleanup_path
-                    elif source_path.is_file():
-                        payload["source_name"] = source_path.name
-                        upload_path = source_path
-                    else:
-                        return tool_error(f"Unsupported local resource path: {url}")
-                    payload["temp_file_id"] = self._client.upload_temp_file(upload_path)
-                elif _is_local_path_reference(url):
-                    return tool_error(f"Local resource path does not exist: {url}")
-                else:
-                    payload["path"] = url
-            else:
-                payload["path"] = url
+            content = source_path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            return tool_error(f"Failed to read file: {e}")
 
-            resp = self._client.post("/api/v1/resources", payload)
-            result = resp.get("result", {})
-        finally:
-            if cleanup_path:
-                cleanup_path.unlink(missing_ok=True)
+        target_uri = args.get("to", "")
+        parent_uri = args.get("parent", "")
+
+        if not target_uri:
+            name = source_path.name
+            if parent_uri:
+                target_uri = parent_uri.rstrip("/") + "/" + name
+            else:
+                target_uri = f"memory://resources/{name}"
+
+        source_url = str(source_path)
+        reason = args.get("reason", "")
+
+        root_uri = self._db.add_resource(
+            uri=target_uri,
+            source_name=source_path.name,
+            content=content,
+            abstract=reason or _truncate(content, _DEFAULT_MAX_ABSTRACT_CHARS),
+            source_url=source_url,
+        )
 
         return json.dumps({
             "status": "added",
-            "root_uri": result.get("root_uri", ""),
-            "message": "Resource queued for processing. Use memory_enhancer_search after a moment to find it.",
+            "root_uri": root_uri,
+            "message": "Resource added to knowledge base. Use memory_enhancer_search to find it.",
         }, ensure_ascii=False)
 
 
