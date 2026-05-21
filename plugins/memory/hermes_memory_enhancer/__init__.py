@@ -492,13 +492,45 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
                 "memory_enhancer_remember, memory_enhancer_add_resource."
             )
 
+    def _format_prefetch_result(self, result: Dict[str, Any]) -> str:
+        """Format search results for automatic prompt injection."""
+        parts = []
+        for ctx_type in ("memories", "resources", "skills"):
+            items = result.get(ctx_type, []) if isinstance(result, dict) else []
+            for item in items[:3]:
+                uri = item.get("uri", "")
+                abstract = item.get("abstract", "")
+                score = item.get("score", 0)
+                if abstract:
+                    try:
+                        score_text = f"{float(score):.2f}"
+                    except Exception:
+                        score_text = "0.00"
+                    parts.append(f"- [{score_text}] {abstract} ({uri})")
+        return "\n".join(parts)
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Return prefetched results from the background thread."""
+        """Return relevant Memory Enhancer context for the current turn.
+
+        Prefer the background result queued after the previous turn, but fall
+        back to a bounded synchronous search so the first turn of a new session
+        also gets relevant context instead of waiting until turn two.
+        """
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=3.0)
         with self._prefetch_lock:
             result = self._prefetch_result
             self._prefetch_result = ""
+        if not result and self._client and query:
+            try:
+                resp = self._client.post("/api/v1/search/find", {
+                    "query": query,
+                    "top_k": 5,
+                })
+                result = self._format_prefetch_result(resp.get("result", {}))
+            except Exception as e:
+                logger.debug("Memory Enhancer synchronous prefetch failed: %s", e)
+                result = ""
         if not result:
             return ""
         return f"## Memory Enhancer Context\n{result}"
@@ -518,19 +550,10 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
                     "query": query,
                     "top_k": 5,
                 })
-                result = resp.get("result", {})
-                parts = []
-                for ctx_type in ("memories", "resources"):
-                    items = result.get(ctx_type, [])
-                    for item in items[:3]:
-                        uri = item.get("uri", "")
-                        abstract = item.get("abstract", "")
-                        score = item.get("score", 0)
-                        if abstract:
-                            parts.append(f"- [{score:.2f}] {abstract} ({uri})")
-                if parts:
+                formatted = self._format_prefetch_result(resp.get("result", {}))
+                if formatted:
                     with self._prefetch_lock:
-                        self._prefetch_result = "\n".join(parts)
+                        self._prefetch_result = formatted
             except Exception as e:
                 logger.debug("Memory Enhancer prefetch failed: %s", e)
 
