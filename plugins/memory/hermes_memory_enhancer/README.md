@@ -14,7 +14,7 @@ This repository is the **Hermes integration layer**:
 - tests for the provider interface
 - documentation for connecting Hermes to a Memory Enhancer server
 
-This repository is **not** the full Memory Enhancer server. A Memory Enhancer server must run separately and expose the REST API at `MEMORY_ENHANCER_ENDPOINT`.
+This repository is **not** the Memory Enhancer server repository and does **not** contain server implementation, server deployment manifests, server database migrations, or production server hardening. A Memory Enhancer server must run separately and expose the REST API at `MEMORY_ENHANCER_ENDPOINT`.
 
 ## System requirements
 

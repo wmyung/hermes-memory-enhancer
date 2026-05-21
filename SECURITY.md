@@ -1,6 +1,20 @@
 # Security Policy
 
-Hermes Memory Enhancer can store and retrieve long-lived agent memory. Treat the Memory Enhancer server and database as sensitive infrastructure.
+Hermes Memory Enhancer can store and retrieve long-lived agent memory. This repository is only the Hermes plugin/integration layer; it is **not** the Memory Enhancer server repository and its security notes do **not** replace server-side threat modeling, authentication, TLS termination, database hardening, or deployment hardening. Treat the separately deployed Memory Enhancer server and database as sensitive infrastructure.
+
+## Server boundary
+
+This repository is **client-side Hermes plugin documentation and code only**. It is not sufficient documentation for operating a production Memory Enhancer server.
+
+A server repository should separately document at least:
+
+- authentication and authorization model
+- TLS/proxy deployment
+- database location, permissions, backup, retention, and deletion
+- network exposure and rate limiting
+- tenant isolation, if multi-user
+- audit logging and incident response
+- handling of PHI/PII, secrets, and regulated data
 
 ## Safe defaults
 
