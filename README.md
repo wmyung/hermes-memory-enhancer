@@ -286,6 +286,14 @@ Memory Enhancer works alongside Hermes' built-in per-agent memory files (`MEMORY
 - **PyYAML** only for `install.sh` / `remove.sh` (install via `pip install PyYAML`)
 - **OS**: Linux, macOS, Windows WSL
 
+### Agent configuration
+
+After installing this plugin, add the following instruction to your agent's `SOUL.md`, `AGENTS.md`, or equivalent configuration file:
+
+> Use `memory_enhancer_*` tools (`search`, `remember`, `browse`, `read`, `stats`) as your primary memory system. The basic `memory` tool is for identity and critical rules only. Call `memory_enhancer_search` before asking the user to repeat themselves. Call `memory_enhancer_remember` for every important fact, decision, or finding.
+
+See [`AGENTS.md`](AGENTS.md) in this repository for the complete agent guidelines.
+
 ### GitHub repository description
 
 Set the repo's About description to:
