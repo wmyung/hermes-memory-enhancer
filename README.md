@@ -36,6 +36,7 @@ Local SQLite database (~/.hermes/memory_enhancer/memory.sqlite3)
 - **`memory_enhancer_browse`**: Filesystem-style navigation (`list`, `tree`, `stat`)
 - **`memory_enhancer_remember`**: Store durable facts (extracted on session commit)
 - **`memory_enhancer_add_resource`**: Import local files into the knowledge base (opt-in)
+- **`memory_enhancer_stats`**: Memory statistics dashboard (totals, categories, importance, DB size)
 
 ## System requirements
 

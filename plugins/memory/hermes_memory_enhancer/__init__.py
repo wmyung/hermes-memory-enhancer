@@ -16,6 +16,8 @@ Capabilities:
   - Full-text search with hierarchical directory retrieval
   - Filesystem-style browsing via memory:// URIs
   - Resource ingestion (local files)
+  - Memory statistics dashboard (memory_enhancer_stats)
+  - Importance-scored memories
 """
 
 from __future__ import annotations
@@ -254,6 +256,8 @@ CREATE TABLE IF NOT EXISTS memories (
     category TEXT NOT NULL DEFAULT 'general',
     content TEXT NOT NULL,
     score REAL NOT NULL DEFAULT 1.0,
+    importance INTEGER NOT NULL DEFAULT 3,
+    expires_at TEXT DEFAULT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -316,6 +320,8 @@ class _MemoryEnhancerSQLite:
         with self._lock:
             cur = self._conn.cursor()
             cur.executescript(_SQLITE_INIT)
+            # Migration: add new columns to existing tables (v1→v2)
+            self._migrate()
             # Seed default directories, substituting agent name
             for stmt in _SQLITE_SEED_DIRS.split(";"):
                 stmt = stmt.strip()
@@ -324,6 +330,17 @@ class _MemoryEnhancerSQLite:
                 sql = stmt.replace("$AGENT", self._agent)
                 cur.execute(sql)
             self._conn.commit()
+
+    def _migrate(self):
+        """Add missing columns from schema upgrades."""
+        try:
+            cols = [r[1] for r in self._conn.execute("PRAGMA table_info(memories)").fetchall()]
+            if "importance" not in cols:
+                self._conn.execute("ALTER TABLE memories ADD COLUMN importance INTEGER NOT NULL DEFAULT 3")
+            if "expires_at" not in cols:
+                self._conn.execute("ALTER TABLE memories ADD COLUMN expires_at TEXT DEFAULT NULL")
+        except sqlite3.OperationalError:
+            pass
 
     def close(self):
         try:
@@ -599,9 +616,44 @@ class _MemoryEnhancerSQLite:
     def get_recent_memories(self, limit: int = 10) -> List[dict]:
         with self._lock:
             cur = self._conn.execute(
-                "SELECT * FROM memories ORDER BY created_at DESC LIMIT ?",
+                "SELECT * FROM memories ORDER BY importance DESC, created_at DESC LIMIT ?",
                 (limit,),
             )
+            return [dict(row) for row in cur.fetchall()]
+
+    def memory_stats(self) -> dict:
+        """Return memory statistics for dashboard."""
+        with self._lock:
+            total = self._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+            cats = self._conn.execute(
+                "SELECT category, COUNT(*) as cnt FROM memories GROUP BY category ORDER BY cnt DESC"
+            ).fetchall()
+            session_count = self._conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+            by_imp = self._conn.execute(
+                "SELECT importance, COUNT(*) FROM memories GROUP BY importance ORDER BY importance DESC"
+            ).fetchall()
+            total_messages = self._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            db_size = os.path.getsize(self._db_path) if os.path.exists(self._db_path) else 0
+            return {
+                "total_memories": total,
+                "total_sessions": session_count,
+                "total_messages": total_messages,
+                "categories": {r["category"]: r["cnt"] for r in cats},
+                "by_importance": {str(r["importance"]): r[1] for r in by_imp},
+                "db_size_kb": round(db_size / 1024, 1),
+            }
+
+    def export_memories(self, limit: int = 0) -> List[dict]:
+        """Export all memories as dict list."""
+        with self._lock:
+            if limit > 0:
+                cur = self._conn.execute(
+                    "SELECT * FROM memories ORDER BY created_at DESC LIMIT ?", (limit,)
+                )
+            else:
+                cur = self._conn.execute(
+                    "SELECT * FROM memories ORDER BY created_at DESC"
+                )
             return [dict(row) for row in cur.fetchall()]
 
     # -- Resource operations -------------------------------------------------
@@ -740,6 +792,20 @@ REMEMBER_SCHEMA = {
             },
         },
         "required": ["content"],
+    },
+}
+
+STATS_SCHEMA = {
+    "name": "memory_enhancer_stats",
+    "description": (
+        "Get memory usage statistics and overview. Returns total memories, "
+        "category distribution, importance distribution, session count, "
+        "message count, and database size. Use this to understand how much "
+        "and what kind of knowledge is stored."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
     },
 }
 
@@ -1041,7 +1107,7 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
         t.start()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [SEARCH_SCHEMA, READ_SCHEMA, BROWSE_SCHEMA, REMEMBER_SCHEMA, ADD_RESOURCE_SCHEMA]
+        return [SEARCH_SCHEMA, READ_SCHEMA, BROWSE_SCHEMA, REMEMBER_SCHEMA, STATS_SCHEMA, ADD_RESOURCE_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if not self._db:
@@ -1056,6 +1122,8 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
                 return self._tool_browse(args)
             elif tool_name == "memory_enhancer_remember":
                 return self._tool_remember(args)
+            elif tool_name == "memory_enhancer_stats":
+                return self._tool_stats(args)
             elif tool_name == "memory_enhancer_add_resource":
                 return self._tool_add_resource(args)
             return tool_error(f"Unknown tool: {tool_name}")
@@ -1267,8 +1335,14 @@ class HermesMemoryEnhancerProvider(MemoryProvider):
 
         return json.dumps({
             "status": "stored",
-            "message": "Memory recorded. Will be extracted and indexed on session commit.",
+            "message": "Memory recorded and indexed immediately.",
         })
+
+    def _tool_stats(self, args: dict) -> str:
+        if not self._db:
+            return tool_error("Memory Enhancer database not connected")
+        stats = self._db.memory_stats()
+        return json.dumps(stats, ensure_ascii=False)
 
     def _tool_add_resource(self, args: dict) -> str:
         if not self._enable_add_resource:
