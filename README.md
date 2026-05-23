@@ -28,6 +28,17 @@ Existing solutions are overkill:
 
 **This is different.** It's not a vector DB. It's not a wiki. It's a **persistent knowledge base** that Hermes queries automatically — session to session, agent to agent, project to project.
 
+### Why this over the alternatives?
+
+| If you use… | Your best choice is… |
+|------------|-------------------|
+| **Hermes Agent only** | **Hermes Memory Enhancer** — 450 lines, 1 dependency, 30-second install. The simplest Hermes memory plugin you can run. |
+| **Hermes Agent + Codex CLI** | **Hermes + Codex Memory Enhancer** — same engine, two interfaces. Hermes remembers your research context; Codex remembers your build context. They stay isolated by design, but you use the same mental model for both. |
+| **Claude Code / Cursor / generic MCP** | Consider **memoirs** or **agentmem** — they have broader MCP support. Our focus is Hermes + Codex. |
+| **Need vector search / graph / cloud sync** | Consider **Mnemosyne** (Hermes + sqlite-vec) or **Mem0** (cloud). Our focus is simplicity, not features. |
+
+We intentionally **don't try to do everything**. We specialize in the simplest possible memory for the two agents that power your daily workflow: your conversation agent (Hermes) and your coding agent (Codex). If you use both, you get a unified memory philosophy across both tools — without the complexity of MCP, vector DBs, or cloud APIs.
+
 ---
 
 ## Features
