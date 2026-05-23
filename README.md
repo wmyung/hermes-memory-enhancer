@@ -349,6 +349,6 @@ PRs welcome. Ideas welcome.
 
 ## Related
 
-- **[Codex Memory Enhancer](https://github.com/wmyung/codex-memory-enhancer)** — the same memory system, adapted for OpenAI Codex CLI, with L3 graph layer included
+- **[Codex CLI Memory Enhancer](https://github.com/wmyung/codex-cli-memory-enhancer)** — the same memory system, adapted for OpenAI Codex CLI, with L3 graph layer included
 - **[Hermes Agent](https://github.com/NousResearch/hermes-agent)** — the multi-provider agent framework this plugin extends
 - **[SQLite FTS5](https://www.sqlite.org/fts5.html)** — the search engine behind it all. No vector DB needed.
