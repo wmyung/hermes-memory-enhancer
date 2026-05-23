@@ -81,6 +81,30 @@ memory_enhancer_stats()
 ```
 Returns: total memories, category distribution, importance distribution, session count, message count, DB size.
 
+### 🧩 L3 Knowledge Graph Layer
+Connect memories with typed relations and visualize the graph — no external database needed.
+
+```bash
+# Point L3 to the same DB as the plugin
+export L3_DB_PATH=~/.hermes/memory_enhancer/memory.sqlite3
+
+# Tag a memory URI
+python3 scripts/l3.py tag add "memory://user/hermes/memories/1" "gwas"
+
+# Relate two nodes
+python3 scripts/l3.py relate \
+  "memory://user/hermes/memories/1" \
+  "memory://user/hermes/memories/2" informs
+
+# Trace connections
+python3 scripts/l3.py trace "memory://user/hermes/memories/1" --depth 3
+
+# Generate interactive HTML graph
+python3 scripts/l3_graph.py graph.html --db ~/.hermes/memory_enhancer/memory.sqlite3
+```
+
+L3 creates three tables (`l3_tags`, `l3_node_tags`, `l3_relations`) alongside your existing memory schema — zero schema changes to your data.
+
 ### 🛡️ Built-in secret redaction
 API keys, tokens, and passwords are automatically redacted from sync payloads and search results. Opt-out via `MEMORY_ENHANCER_REDACT_SECRETS=false`.
 
@@ -198,6 +222,9 @@ The plugin connects Hermes directly to a local SQLite database. There is no exte
 | `memories` | Extracted + explicitly stored facts |
 | `memories_fts` | FTS5 search index over memories |
 | `resources` | Imported file metadata |
+| `l3_tags` | Tag definitions (L3 layer) |
+| `l3_node_tags` | Node-to-tag assignments (L3 layer) |
+| `l3_relations` | Directed typed relations between nodes (L3 layer) |
 
 ### Automatic session extraction
 
@@ -268,6 +295,9 @@ hermes-memory-enhancer/
 ├── README.md                           ← This file
 ├── SECURITY.md                         ← Security policy
 ├── LICENSE                             ← MIT
+├── scripts/
+│   ├── l3.py                           ← L3 knowledge graph CLI (companion tool)
+│   └── l3_graph.py                     ← L3 interactive HTML graph viewer
 ├── plugins/memory/hermes_memory_enhancer/
 │   ├── __init__.py                     ← MemoryProvider plugin (~450 lines)
 │   ├── plugin.yaml                     ← Plugin metadata
@@ -309,6 +339,7 @@ Key defaults:
 
 - [ ] TTL-based auto-expiry for memories
 - [ ] Memory consolidation (merge duplicates)
+- [ ] L3 graph web app (auto-refresh)
 - [ ] Per-project namespace isolation
 - [ ] Optional sentence-transformers semantic search
 
@@ -318,6 +349,6 @@ PRs welcome. Ideas welcome.
 
 ## Related
 
-- **[Codex Memory Enhancer](https://github.com/wmyung/codex-memory-enhancer)** — the same memory system, adapted for OpenAI Codex CLI
+- **[Codex Memory Enhancer](https://github.com/wmyung/codex-memory-enhancer)** — the same memory system, adapted for OpenAI Codex CLI, with L3 graph layer included
 - **[Hermes Agent](https://github.com/NousResearch/hermes-agent)** — the multi-provider agent framework this plugin extends
 - **[SQLite FTS5](https://www.sqlite.org/fts5.html)** — the search engine behind it all. No vector DB needed.
