@@ -290,7 +290,13 @@ Memory Enhancer works alongside Hermes' built-in per-agent memory files (`MEMORY
 
 After installing this plugin, add the following instruction to your agent's `SOUL.md`, `AGENTS.md`, or equivalent configuration file:
 
-> Use `memory_enhancer_*` tools (`search`, `remember`, `browse`, `read`, `stats`) as your primary memory system. The basic `memory` tool is for identity and critical rules only. Call `memory_enhancer_search` before asking the user to repeat themselves. Call `memory_enhancer_remember` for every important fact, decision, or finding.
+> **Primary memory system:** Use `memory_enhancer_*` tools (`search`, `remember`, `browse`, `read`, `stats`) over the basic `memory` tool. The basic `memory` tool is for identity and critical rules only — it is injected every turn. Use `memory_enhancer_*` for everything else: it is searchable, shared across agents, and does not bloat context.
+>
+> **Session start:** Call `memory_enhancer_stats` or `memory_enhancer_search` to restore context before asking the user to catch up.
+>
+> **During session:** Call `memory_enhancer_remember` for every important fact, decision, or finding.
+>
+> **Session end:** Ensure critical new facts are saved. The plugin auto-extracts `[Remember]` messages, but explicit `memory_enhancer_remember` calls are more reliable.
 
 See [`AGENTS.md`](AGENTS.md) in this repository for the complete agent guidelines.
 
