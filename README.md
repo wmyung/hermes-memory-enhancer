@@ -300,12 +300,6 @@ After installing this plugin, add the following instruction to your agent's `SOU
 
 See [`AGENTS.md`](AGENTS.md) in this repository for the complete agent guidelines.
 
-### GitHub repository description
-
-Set the repo's About description to:
-
-> 450 lines, one dep. SQLite-backed persistent memory plugin for Hermes Agent. No server, no vector DB, no cloud — the simplest Hermes memory provider you can run.
-
 ---
 
 ## Project Structure
