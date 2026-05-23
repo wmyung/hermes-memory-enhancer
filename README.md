@@ -15,6 +15,8 @@
   <code>bash install.sh</code> → Hermes remembers everything. Done.
 </p>
 
+> **About this project:** 450 lines of Python. One dependency (PyYAML — for the installer only). No server. No daemon. No Docker. No cloud. No API keys. No vector DB. Just a single SQLite file and the Hermes plugin interface. We believe agent memory should be a **plugin**, not an infrastructure project. Thirty seconds from `git clone` to your first remembered fact.
+
 ---
 
 ## The Problem
