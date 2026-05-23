@@ -286,6 +286,12 @@ Memory Enhancer works alongside Hermes' built-in per-agent memory files (`MEMORY
 - **PyYAML** only for `install.sh` / `remove.sh` (install via `pip install PyYAML`)
 - **OS**: Linux, macOS, Windows WSL
 
+### GitHub repository description
+
+Set the repo's About description to:
+
+> 450 lines, one dep. SQLite-backed persistent memory plugin for Hermes Agent. No server, no vector DB, no cloud — the simplest Hermes memory provider you can run.
+
 ---
 
 ## Project Structure
