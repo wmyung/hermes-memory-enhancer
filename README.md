@@ -292,6 +292,7 @@ Memory Enhancer works alongside Hermes' built-in per-agent memory files (`MEMORY
 
 ```
 hermes-memory-enhancer/
+├── AGENTS.md                          ← Agent guidelines (read this if you're an AI)
 ├── README.md                           ← This file
 ├── SECURITY.md                         ← Security policy
 ├── LICENSE                             ← MIT
