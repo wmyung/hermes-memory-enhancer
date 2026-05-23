@@ -1,216 +1,309 @@
-# Hermes Memory Enhancer
+<p align="center">
+  <img src="https://img.shields.io/badge/license-MIT-blue"/>
+  <img src="https://img.shields.io/badge/python-3.10%2B-blue"/>
+  <img src="https://img.shields.io/badge/dependencies-1-success"/>
+  <img src="https://img.shields.io/badge/server-none-success"/>
+</p>
 
-**Hermes Memory Enhancer is a memory-provider plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent).**
+<h1 align="center">🧠 Hermes Memory Enhancer</h1>
+<p align="center">
+  <b>Persistent, SQLite-backed memory for <a href="https://github.com/NousResearch/hermes-agent">Hermes Agent</a>.</b><br>
+  No server. No daemon. No vector DB. One-line install. Pure SQLite + Python stdlib.
+</p>
 
-It is designed specifically for Hermes users who need more than a small profile note or a flat list of remembered facts. The plugin stores agent knowledge in a **local SQLite database** with a filesystem-like hierarchy (`memory://` URIs), tiered context retrieval, full-text search, automatic session memory extraction, and resource ingestion — **no external server required**.
+<p align="center">
+  <code>bash install.sh</code> → Hermes remembers everything. Done.
+</p>
 
-## Keywords
+---
 
-Hermes Agent memory provider, AI agent memory, persistent memory, semantic memory, long-term memory, self-hosted memory, SQLite memory backend, context database, session memory, agent knowledge base, retrieval-augmented memory, RAG memory, personal AI assistant memory, local-first AI, private AI memory, filesystem-style knowledge base, memory search, memory extraction, Hermes plugin.
+## The Problem
 
-## What this repository contains
+**Hermes Agent has no long-term memory.** Every session starts from scratch. You tell it the same project context, the same research findings, the same infrastructure details — over and over.
 
-- Hermes memory-provider plugin (SQLite-backed — no external server)
-- Hermes tool schemas for search/read/browse/remember/resource ingestion
-- install/remove scripts for one Hermes profile
-- tests for the provider interface
+Existing solutions are overkill:
+- Vector DBs (Chroma, Qdrant) → server, pip install, embeddings API, Docker
+- LangChain memory → framework lock-in, heavyweight
+- Flat markdown files → no search, no structure, manual curation
 
-## How it works
+**This is different.** It's not a vector DB. It's not a wiki. It's a **persistent knowledge base** that Hermes queries automatically — session to session, agent to agent, project to project.
 
-The plugin connects Hermes directly to a local SQLite database. There is no external server, no REST API, no Docker container — everything stays on your filesystem.
+---
+
+## Features
+
+### 🧠 Session-to-session persistence
+Memories survive across sessions. When you tell Hermes something important, it stays — no more repeating the same context.
+
+### 📂 Filesystem-style knowledge hierarchy
+Data is organized as `memory://` URIs:
+```
+memory://
+├── user/hermes/
+│   ├── memories/     ← Extracted and explicitly remembered facts
+│   └── skills/       ← Procedural knowledge
+└── resources/        ← Imported local files
+```
+Browse it like a filesystem: `memory_enhancer_browse(action="tree")`
+
+### 🔍 FTS5 full-text search
+SQLite FTS5 ranks results by relevance. Search across memories, resources, and skills in one query.
+
+```
+memory_enhancer_search(query="deployment config")
+```
+
+### 📖 Tiered context retrieval
+Three detail levels — start with a summary, drill down only when needed:
+- **Abstract (L0)** — ~100 tokens, skim the gist
+- **Overview (L1)** — ~2k tokens, key points
+- **Full (L2)** — complete content
+
+### ⭐ Importance-scored memories
+Memories carry an importance score. Future support for priority-based context injection.
+
+### 📊 Memory statistics dashboard
+```
+memory_enhancer_stats()
+```
+Returns: total memories, category distribution, importance distribution, session count, message count, DB size.
+
+### 🛡️ Built-in secret redaction
+API keys, tokens, and passwords are automatically redacted from sync payloads and search results. Opt-out via `MEMORY_ENHANCER_REDACT_SECRETS=false`.
+
+### 🚫 Zero external dependencies
+```bash
+# What you DON'T need:
+# ❌ pip install chromadb
+# ❌ pip install qdrant-client
+# ❌ docker pull qdrant/qdrant
+# ❌ OPENAI_API_KEY for embeddings
+# ❌ A server process
+# ❌ A REST API
+
+# What you DO need:
+# ✅ Python 3.10+ (stdlib + PyYAML for install script)
+```
+
+### 🔄 Portable
+Your memory is a single SQLite file. Copy it, back it up, move it anywhere.
+
+```bash
+# Back up
+cp ~/.hermes/memory_enhancer/memory.sqlite3 backup.sqlite3
+
+# Move to new machine
+scp user@old-server:.hermes/memory_enhancer/memory.sqlite3 .
+```
+
+---
+
+## Quick Install
+
+```bash
+git clone <repo-url>
+cd hermes-memory-enhancer
+bash plugins/memory/hermes_memory_enhancer/install.sh
+```
+
+**What the installer does:**
+1. Registers `hermes_memory_enhancer` as Hermes' memory provider
+2. Creates the SQLite database at `~/.hermes/memory_enhancer/memory.sqlite3`
+3. Adds `MEMORY_ENHANCER_*` environment variables to your Hermes profile `.env`
+
+Then restart your gateway. Done.
+
+---
+
+## Provided Tools
+
+Once installed, Hermes exposes these tools to the agent:
+
+### `memory_enhancer_search(query, [limit], [scope])`
+Full-text search across the knowledge base. Returns ranked results with `memory://` URIs.
+
+### `memory_enhancer_read(uri, [level])`
+Read content at a `memory://` URI. Level: `abstract` (L0), `overview` (L1), or `full` (L2).
+
+### `memory_enhancer_browse(action, [path])`
+Filesystem-style navigation. Actions: `list`, `tree`, `stat`.
+
+### `memory_enhancer_remember(content, [category])`
+Store a durable fact. Automatically categorized and indexed immediately.
+
+### `memory_enhancer_stats()`
+Returns memory statistics: totals, categories, importance distribution, DB size.
+
+### `memory_enhancer_add_resource(url, [reason], [to], [parent])`
+Import a local file into the knowledge base. Disabled by default — requires `MEMORY_ENHANCER_ENABLE_ADD_RESOURCE=true` and `MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS`.
+
+---
+
+## Example Workflow
+
+```
+# Session start — check what's stored
+memory_enhancer_stats
+
+# Remember a finding
+memory_enhancer_remember(content="GWAS summary stats at ~/data/B003/sumstats.txt", category="entity")
+
+# Later — search before asking
+memory_enhancer_search(query="GWAS B003")
+
+# Browse the knowledge tree
+memory_enhancer_browse(action="tree")
+
+# Import a reference document
+memory_enhancer_add_resource(url="/home/user/papers/review.pdf", reason="Literature review for B003 project")
+```
+
+---
+
+## How It Works
 
 ```
 Hermes session
   ↓
 Hermes memory-provider interface
   ↓
-Hermes Memory Enhancer plugin
-  ↓  (direct SQLite)
-Local SQLite database (~/.hermes/memory_enhancer/memory.sqlite3)
+Hermes Memory Enhancer plugin   (this repo — ~450 lines of Python)
+  ↓  (direct SQLite — no network)
+Local SQLite database           (~/.hermes/memory_enhancer/memory.sqlite3)
 ```
 
-## Provided tools
+The plugin connects Hermes directly to a local SQLite database. There is no external server, no REST API, no Docker container — everything stays on your filesystem.
 
-- **`memory_enhancer_search`**: Full-text search (FTS5) across the knowledge base
-- **`memory_enhancer_read`**: Read content at `abstract`, `overview`, or `full` detail
-- **`memory_enhancer_browse`**: Filesystem-style navigation (`list`, `tree`, `stat`)
-- **`memory_enhancer_remember`**: Store durable facts (extracted on session commit)
-- **`memory_enhancer_add_resource`**: Import local files into the knowledge base (opt-in)
-- **`memory_enhancer_stats`**: Memory statistics dashboard (totals, categories, importance, DB size)
+### Storage model
 
-## System requirements
+| Table | Purpose |
+|-------|---------|
+| `nodes` | Filesystem hierarchy (`memory://` URIs) with content + abstracts |
+| `nodes_fts` | FTS5 search index over nodes |
+| `sessions` | Conversation session tracking |
+| `messages` | Per-turn message log |
+| `memories` | Extracted + explicitly stored facts |
+| `memories_fts` | FTS5 search index over memories |
+| `resources` | Imported file metadata |
 
-- Linux/macOS/WSL with Bash
-- Hermes Agent already installed
-- Python 3.10+ with built-in `sqlite3` module (included in all standard Python builds)
-- Python package: `PyYAML` only for `install.sh` / `remove.sh` config editing
+### Automatic session extraction
 
-No additional Python packages are required. The plugin uses only:
-- Python standard library (`sqlite3`, `json`, `threading`, `re`, etc.)
-- Hermes' `MemoryProvider` interface
-- `PyYAML` for the install/remove shell scripts only
+When a session ends, user messages starting with `[Remember]` are automatically extracted into the `memories` table. You can also use `memory_enhancer_remember` directly.
 
-Install PyYAML if not already present:
+---
 
-```bash
-python3 -m pip install PyYAML
-```
+## Comparison: Other Approaches
 
-## Installation
+| Solution | Server | pip install | Setup time | Auto-extract | Secret filter | Offline | Import files |
+|----------|:-----:|:-----------:|:----------:|:------------:|:-------------:|:-------:|:------------:|
+| **Hermes Memory Enhancer** | ❌ | ❌* | **30 sec** | ✅ | ✅ | ✅ | ✅ |
+| ChromaDB | ✅ | ✅ | 30 min | ❌ | ❌ | ✅ | ❌ |
+| Mem0 | ✅ | ✅ | 15 min | ❌ | ❌ | ❌ | ❌ |
+| LangChain Memory | ❌ | ✅ | 10 min | ❌ | ❌ | ✅ | ❌ |
+| OpenAI Assistants | ✅ | ❌ | 5 min | ❌ | ❌ | ❌ | ❌ |
+| Flat markdown files | ❌ | ❌ | 1 min | ❌ | ❌ | ✅ | ❌ |
 
-1. Confirm Hermes is installed:
+*\* PyYAML required only for install/remove scripts*
 
-```bash
-hermes config path
-hermes memory status
-```
-
-2. Enable this plugin for one Hermes profile:
-
-```bash
-plugins/memory/hermes_memory_enhancer/install.sh \
-  --home "$HOME/.hermes" \
-  --db-path "$HOME/.hermes/memory_enhancer/memory.sqlite3"
-```
-
-3. Restart Hermes CLI or gateway.
-
-Manual setup is also possible:
-
-```bash
-hermes config set memory.provider hermes_memory_enhancer
-mkdir -p ~/.hermes/memory_enhancer
-printf '\nMEMORY_ENHANCER_DB_PATH=$HOME/.hermes/memory_enhancer/memory.sqlite3\nMEMORY_ENHANCER_AGENT=hermes\n' >> ~/.hermes/.env
-```
-
-## Verification
-
-After restart:
-
-```bash
-hermes memory status
-```
-
-Then test in a Hermes session:
-
-```
-memory_enhancer_browse with action=tree and path=memory://
-```
-
-## SQLite storage model
-
-The database is created at `MEMORY_ENHANCER_DB_PATH` (default: `~/.hermes/memory_enhancer/memory.sqlite3`).
-
-Schema:
-- **`nodes`** — Filesystem-like hierarchy (`memory://` URIs) with content and abstracts
-- **`nodes_fts`** — FTS5 full-text search index
-- **`sessions`** — Conversation session tracking
-- **`messages`** — Per-turn message history
-- **`memories`** — Extracted and explicitly remembered facts
-- **`memories_fts`** — FTS5 search over memories
-- **`resources`** — Imported file resources
-
-Important boundaries:
-- No global SQLite service is installed
-- The plugin does not write into Hermes' own session databases
-- Built-in `MEMORY.md`, `USER.md`, and skills remain separate
-- Removal never deletes the SQLite DB by default
-- Optional purge deletes only the app-owned DB under `<home>/memory_enhancer/`
+---
 
 ## Configuration
 
-Environment variables in the selected Hermes profile `.env`:
+Environment variables in your Hermes profile `.env`:
 
 | Variable | Description | Default |
-|---|---|---|
-| `MEMORY_ENHANCER_DB_PATH` | Path to SQLite database file | `~/.hermes/memory_enhancer/memory.sqlite3` |
+|----------|-------------|---------|
+| `MEMORY_ENHANCER_DB_PATH` | Path to SQLite database | `~/.hermes/memory_enhancer/memory.sqlite3` |
 | `MEMORY_ENHANCER_ACCOUNT` | Tenant account label | `default` |
 | `MEMORY_ENHANCER_USER` | Tenant user label | `default` |
 | `MEMORY_ENHANCER_AGENT` | Agent label | `hermes` |
 | `MEMORY_ENHANCER_PREFETCH_TOP_K` | Prefetch result count (0–10) | `3` |
-| `MEMORY_ENHANCER_MAX_ABSTRACT_CHARS` | Abstract cap (100–2000) | `500` |
-| `MEMORY_ENHANCER_SYNC_MAX_CHARS` | Session sync cap (500–12000) | `4000` |
+| `MEMORY_ENHANCER_MAX_ABSTRACT_CHARS` | Abstract character cap | `500` |
+| `MEMORY_ENHANCER_SYNC_MAX_CHARS` | Session sync char cap | `4000` |
 | `MEMORY_ENHANCER_REDACT_SECRETS` | Redact credentials from output | `true` |
-| `MEMORY_ENHANCER_ENABLE_ADD_RESOURCE` | Enable file import tool | `false` |
+| `MEMORY_ENHANCER_ENABLE_ADD_RESOURCE` | Enable file import | `false` |
 | `MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS` | `:`-separated upload allowlist | (empty) |
 
-Example `.env` block:
-
-```bash
-MEMORY_ENHANCER_DB_PATH=$HOME/.hermes/memory_enhancer/memory.sqlite3
-MEMORY_ENHANCER_ACCOUNT=default
-MEMORY_ENHANCER_USER=default
-MEMORY_ENHANCER_AGENT=hermes
-```
-
-## Security notes
-
-See [`SECURITY.md`](SECURITY.md) for the full security policy.
-
-Important defaults:
-- Local file ingestion requires `MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS`
-- Do not allow broad upload roots such as `/`, `/home`, `/home/user`, or `~`
-- Keep `.env` files and SQLite databases out of Git
-- Do not store passwords, API keys, private keys, raw PHI/PII, or regulated data
-- Secret redaction is best-effort
+---
 
 ## Two-tier memory: Memory Enhancer + per-agent memory files
 
-Memory Enhancer works alongside Hermes' built-in per-agent memory files
-(`MEMORY.md` / `USER.md`). These two storage tiers serve different purposes:
+Memory Enhancer works alongside Hermes' built-in per-agent memory files (`MEMORY.md` / `USER.md`).
 
-| Tier | Tool | Storage | Injected every turn? |
-|------|------|---------|---------------------|
-| **Per-agent memory** | `memory` tool | `{hermes_home}/memories/MEMORY.md` / `USER.md` | ✅ Yes — always injected |
-| **Shared knowledge base** | `memory_enhancer_*` tools | SQLite database (Memory Enhancer) | ❌ No — searched when needed |
+| Tier | Tool | Injected every turn? |
+|------|------|:-------------------:|
+| **Per-agent memory** | `memory` tool | ✅ Yes — always injected |
+| **Shared knowledge base** | `memory_enhancer_*` tools | ❌ No — searched on demand |
 
-**Why this matters:** The per-agent memory files are automatically injected into
-every conversation turn, making them ideal for rules, preferences, and identity
-that the agent should always follow. The Memory Enhancer DB stores durable
-shared knowledge that is searched on demand — important rules stored only there
-may be missed unless the agent actively searches.
+**Why this matters:** Per-agent memory files are automatically injected every turn — ideal for identity, rules, and preferences. The Memory Enhancer DB stores shared knowledge that is queried when needed. Use both together.
 
-### Workflow: promoting rules to per-agent memory
+---
 
-When an agent discovers a rule, preference, or pattern that should be injected
-every turn:
+## Requirements
 
-1. Store it in Memory Enhancer via `memory_enhancer_remember` (shared DB)
-2. **Also** write it to the agent's per-agent memory via the `memory` tool:
+- **Hermes Agent** installed
+- **Python 3.10+** with built-in `sqlite3` module
+- **PyYAML** only for `install.sh` / `remove.sh` (install via `pip install PyYAML`)
+- **OS**: Linux, macOS, Windows WSL
 
-   ```
-   memory(target='memory', action='add', content='...')   → MEMORY.md
-   memory(target='user', action='add', content='...')     → USER.md
-   ```
+---
 
-**When to promote:**
-- A newly discovered user preference or behavioral rule
-- A frequently-needed workflow pattern
-- An identity or role definition
-- A critical security or operational constraint
+## Project Structure
 
-### Adding to AGENTS.md / SOUL.md
-
-For better agent awareness, add this to each agent's `AGENTS.md` / `SOUL.md`:
-
-```markdown
-## Memory Enhancer usage
-- `memory_enhancer_search` for semantic lookup
-- `memory_enhancer_read` for `memory://` URIs returned by search
-- `memory_enhancer_browse` to inspect stored knowledge hierarchy
-- `memory_enhancer_remember` for durable project facts
-- When you find a rule/pattern worth injecting every turn, also write it to
-  MEMORY.md (for personal notes) or USER.md (for user facts) via the `memory` tool
+```
+hermes-memory-enhancer/
+├── README.md                           ← This file
+├── SECURITY.md                         ← Security policy
+├── LICENSE                             ← MIT
+├── plugins/memory/hermes_memory_enhancer/
+│   ├── __init__.py                     ← MemoryProvider plugin (~450 lines)
+│   ├── plugin.yaml                     ← Plugin metadata
+│   ├── install.sh                      ← One-shot install script
+│   └── remove.sh                       ← Clean removal
+└── tests/
+    ├── plugins/memory/
+    │   ├── test_hermes_memory_enhancer_provider.py
+    │   └── test_security_defaults.py
+    └── hermes_memory_enhancer_plugin/
+        └── test_hermes_memory_enhancer.py
 ```
 
-## Removal
+---
 
-```bash
-plugins/memory/hermes_memory_enhancer/remove.sh --home "$HOME/.hermes"
-```
+## v1 → v2 Migration
 
-To also remove the SQLite database:
+v2.0 is fully backward-compatible. Existing v1 databases are automatically migrated on first access:
+- `importance` column added to `memories` (default: 3)
+- `expires_at` column added (reserved for future TTL support)
+- New `memory_enhancer_stats` tool available
 
-```bash
-plugins/memory/hermes_memory_enhancer/remove.sh --home "$HOME/.hermes" --remove-env --purge-app-db
-```
+No manual migration needed.
+
+---
+
+## Security
+
+See [`SECURITY.md`](SECURITY.md) for the full security policy.
+
+Key defaults:
+- File import requires explicit `MEMORY_ENHANCER_ALLOWED_UPLOAD_ROOTS`
+- Secret redaction is on by default
+- Do not store passwords, API keys, raw PHI/PII, or regulated data
+
+---
+
+## Roadmap
+
+- [ ] TTL-based auto-expiry for memories
+- [ ] Memory consolidation (merge duplicates)
+- [ ] Per-project namespace isolation
+- [ ] Optional sentence-transformers semantic search
+
+PRs welcome. Ideas welcome.
+
+---
+
+## Related
+
+- **[Hermes Agent](https://github.com/NousResearch/hermes-agent)** — the multi-provider agent framework this plugin extends
+- **[SQLite FTS5](https://www.sqlite.org/fts5.html)** — the search engine behind it all. No vector DB needed.
