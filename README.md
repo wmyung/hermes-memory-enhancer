@@ -296,8 +296,8 @@ hermes-memory-enhancer/
 ├── SECURITY.md                         ← Security policy
 ├── LICENSE                             ← MIT
 ├── scripts/
-│   ├── l3.py                           ← L3 knowledge graph CLI (companion tool)
-│   └── l3_graph.py                     ← L3 interactive HTML graph viewer
+│   ├── l3.py                           ← L3 CLI
+│   └── l3_graph.py                     ← HTML graph generator
 ├── plugins/memory/hermes_memory_enhancer/
 │   ├── __init__.py                     ← MemoryProvider plugin (~450 lines)
 │   ├── plugin.yaml                     ← Plugin metadata
