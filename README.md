@@ -8,7 +8,8 @@
 <h1 align="center">🧠 Hermes Memory Enhancer</h1>
 <p align="center">
   <b>Persistent, SQLite-backed memory for <a href="https://github.com/NousResearch/hermes-agent">Hermes Agent</a>.</b><br>
-  No server. No daemon. No vector DB. One-line install. Pure SQLite + Python stdlib.
+  No server. No daemon. No vector DB. One-line install. Pure SQLite + Python stdlib.<br>
+  <small>Keywords: hermes-memory-enhancer, sqlite-memory, agent-memory, hermes-plugin, persistent-memory, hermes-agent, semantic-search, self-hosted-memory</small>
 </p>
 
 <p align="center">
