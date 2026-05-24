@@ -63,11 +63,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="legend">
       <div><span class="dot" style="background:#e94560"></span> Memory</div>
       <div><span class="dot" style="background:#0f3460"></span> Resource</div>
-      <div><span class="dot" style="background:#e94560"></span> — informs</div>
-      <div><span class="dot" style="background:#533483"></span> — supports</div>
-      <div><span class="dot" style="background:#e9c46a"></span> — contradicts</div>
-      <div><span class="dot" style="background:#2a9d8f"></span> — extends</div>
-      <div><span class="dot" style="background:#888"></span> — related_to</div>
+      <div><span class="dot" style="background:#e94560"></span> informs</div>
+      <div><span class="dot" style="background:#533483"></span> supports</div>
+      <div><span class="dot" style="background:#e9c46a"></span> contradicts</div>
+      <div><span class="dot" style="background:#2a9d8f"></span> extends</div>
+      <div><span class="dot" style="background:#4ecdc4"></span> precedes</div>
+      <div><span class="dot" style="background:#ff6b6b"></span> follows</div>
+      <div><span class="dot" style="background:#ffe66d"></span> contemporaneous</div>
+      <div><span class="dot" style="background:#888"></span> related_to</div>
     </div>
     <div class="stats" id="stats"></div>
   </div>
@@ -89,7 +92,7 @@ svg.call(d3.zoom().scaleExtent([0.1, 4]).on('zoom', (e) => g.attr('transform', e
 
 // Arrow markers
 const defs = svg.append('defs');
-const colors = {'informs':'#e94560','supports':'#533483','contradicts':'#e9c46a','extends':'#2a9d8f','related_to':'#888'};
+const colors = {'informs':'#e94560','supports':'#533483','contradicts':'#e9c46a','extends':'#2a9d8f','related_to':'#888','precedes':'#4ecdc4','follows':'#ff6b6b','contemporaneous':'#ffe66d'};
 for (const [t, c] of Object.entries(colors)) {
   defs.append('marker').attr('id', 'arrow-'+t).attr('viewBox','0 -5 10 10').attr('refX',20).attr('refY',0).attr('markerWidth',6).attr('markerHeight',6).attr('orient','auto')
     .append('path').attr('d','M0,-5L10,0L0,5').attr('fill',c);

@@ -83,7 +83,7 @@ memory_enhancer_stats()
 Returns: total memories, category distribution, importance distribution, session count, message count, DB size.
 
 ### 🧩 L3 Knowledge Graph Layer
-Connect memories with typed relations and visualize the graph — no external database needed.
+Connect memories with typed relations (semantic + temporal) and visualize the graph — no external database needed.
 
 ```bash
 # Point L3 to the same DB as the plugin
@@ -92,19 +92,34 @@ export L3_DB_PATH=~/.hermes/memory_enhancer/memory.sqlite3
 # Tag a memory URI
 python3 scripts/l3.py tag add "memory://user/hermes/memories/1" "gwas"
 
-# Relate two nodes
+# Relate two nodes (semantic relations)
 python3 scripts/l3.py relate \
   "memory://user/hermes/memories/1" \
   "memory://user/hermes/memories/2" informs
 
-# Trace connections
+# Relate two nodes with temporal ordering
+python3 scripts/l3.py relate \
+  "memory://user/hermes/memories/1" \
+  "memory://user/hermes/memories/2" precedes
+
+# Trace connections (optionally filter by relation type)
 python3 scripts/l3.py trace "memory://user/hermes/memories/1" --depth 3
+python3 scripts/l3.py trace "memory://user/hermes/memories/1" precedes
+
+# Temporal timeline — follow precedes/follows chains
+python3 scripts/l3.py timeline "memory://user/hermes/memories/1"
 
 # Generate interactive HTML graph
 python3 scripts/l3_graph.py graph.html --db ~/.hermes/memory_enhancer/memory.sqlite3
 ```
 
 L3 creates three tables (`l3_tags`, `l3_node_tags`, `l3_relations`) alongside your existing memory schema — zero schema changes to your data.
+
+**Relation types:**
+- **Semantic:** `informs`, `supports`, `contradicts`, `extends`, `built-from`, `related_to`
+- **Temporal:** `precedes` (source before target), `follows` (source after target), `contemporaneous` (same time period)
+
+Use temporal types to build a chronological knowledge graph — the `timeline` command traces precedes/follows chains automatically, surfacing "what happened before/after this" relationships across stored memories.
 
 ### 🛡️ Built-in secret redaction
 API keys, tokens, and passwords are automatically redacted from sync payloads and search results. Opt-out via `MEMORY_ENHANCER_REDACT_SECRETS=false`.

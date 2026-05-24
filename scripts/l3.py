@@ -6,21 +6,32 @@ Tags + Relations + Graph traversal for any SQLite-backed knowledge base.
 Drop-in layer: creates l3_tags, l3_node_tags, l3_relations tables alongside
 your existing data, leaving it untouched.
 
+Supports semantic relations (informs, supports, contradicts, extends, ...)
+and temporal relations (precedes, follows, contemporaneous) for time-aware
+knowledge graph traversal.
+
 Usage:
   # Tag a node (any URI)
   l3 tag add memory://my-project/concept "gwas"
   l3 tag remove memory://my-project/concept "gwas"
 
-  # Relate two nodes
+  # Relate two nodes (semantic or temporal)
   l3 relate memory://source memory://target informs
+  l3 relate memory://plan memory://exec precedes
+
+  # Remove a relation
   l3 unrelate memory://source memory://target
 
   # Search by tag
   l3 search tag gwas
   l3 search all
 
-  # Graph traversal from a node
+  # Graph traversal from a node (optionally filter by type)
   l3 trace memory://my-project/concept
+  l3 trace memory://my-project/concept precedes
+
+  # Temporal timeline — follow precedes/follows chains
+  l3 timeline memory://my-node
 
   # Stats
   l3 stats
@@ -29,10 +40,16 @@ Usage:
 import sqlite3
 import sys
 import os
-from datetime import datetime
+import argparse
 
 DEFAULT_DB = os.environ.get("L3_DB_PATH", "l3.db")
 
+RECOGNIZED_RELATIONS = frozenset({
+    # Semantic relations
+    "informs", "supports", "contradicts", "extends", "built-from", "related_to",
+    # Temporal relations
+    "precedes", "follows", "contemporaneous",
+})
 
 SQL_CREATE = """
 CREATE TABLE IF NOT EXISTS l3_tags (
@@ -76,6 +93,25 @@ def get_db(path: str):
     return db
 
 
+def _validate_relation_type(rel_type: str):
+    """Warn if relation type is unrecognized, but still allow it."""
+    if rel_type not in RECOGNIZED_RELATIONS:
+        suggestions = ", ".join(sorted(RECOGNIZED_RELATIONS))
+        print(f"! Unrecognized relation type '{rel_type}' — not in recognized set.")
+        print(f"  Recognized types: {suggestions}")
+        print(f"  (Proceeding anyway — data stored as-is)")
+
+
+def _get_tags_str(db, uri: str) -> str:
+    tags = db.execute(
+        """SELECT t.name FROM l3_node_tags nt JOIN l3_tags t ON nt.tag_id = t.id WHERE nt.node_uri = ?""",
+        (uri,),
+    ).fetchall()
+    return f"  [{', '.join(r['name'] for r in tags)}]" if tags else ""
+
+
+# ── Tag commands ──
+
 def cmd_tag_add(db, uri: str, tag: str):
     tag = tag.strip().lower().replace(" ", "-")
     db.execute("INSERT OR IGNORE INTO l3_tags (name) VALUES (?)", (tag,))
@@ -96,13 +132,16 @@ def cmd_tag_remove(db, uri: str, tag: str):
         print(f"! Tag '{tag}' not found")
 
 
+# ── Relation commands ──
+
 def cmd_relate(db, source: str, target: str, rel_type: str = "related_to"):
+    _validate_relation_type(rel_type)
     db.execute(
         "INSERT OR REPLACE INTO l3_relations (source_uri, target_uri, relation_type) VALUES (?, ?, ?)",
         (source, target, rel_type),
     )
     db.commit()
-    print(f"✓ {source} --[{rel_type}]--> {target}")
+    print(f"✓ {source}\n     ──[{rel_type}]──→\n   {target}")
 
 
 def cmd_unrelate(db, source: str, target: str, rel_type: str = None):
@@ -119,6 +158,8 @@ def cmd_unrelate(db, source: str, target: str, rel_type: str = None):
     db.commit()
     print(f"✓ Relation removed")
 
+
+# ── Search commands ──
 
 def cmd_search_tag(db, tag: str):
     tag = tag.strip().lower().replace(" ", "-")
@@ -154,43 +195,129 @@ def cmd_search_tag_all(db):
     print(f"  Total: {len(rows)} tags")
 
 
-def cmd_trace(db, uri: str, depth: int = 2):
-    """Graph traversal from a URI — shows what it relates to and what relates to it."""
+# ── Trace (general graph traversal) ──
+
+def cmd_trace(db, uri: str, depth: int = 2, rel_type: str = None):
+    """Graph traversal from a URI — optionally filtered by relation type."""
     visited = set()
-    _trace_recursive(db, uri, 0, depth, visited)
+    _trace_recursive(db, uri, 0, depth, visited, rel_type)
 
 
-def _trace_recursive(db, uri: str, current_depth: int, max_depth: int, visited: set):
+def _trace_recursive(db, uri: str, current_depth: int, max_depth: int, visited: set, rel_type: str = None):
     if current_depth > max_depth or uri in visited:
         return
     visited.add(uri)
     indent = "  " * current_depth
     prefix = "→" if current_depth > 0 else "●"
-    tags = db.execute(
-        """SELECT t.name FROM l3_node_tags nt JOIN l3_tags t ON nt.tag_id = t.id WHERE nt.node_uri = ?""",
-        (uri,),
-    ).fetchall()
-    tag_str = f"  [{', '.join(r['name'] for r in tags)}]" if tags else ""
+    tag_str = _get_tags_str(db, uri)
     print(f"{indent}{prefix} {uri}{tag_str}")
 
-    outgoing = db.execute(
-        "SELECT target_uri, relation_type FROM l3_relations WHERE source_uri = ?",
-        (uri,),
-    ).fetchall()
+    if rel_type:
+        outgoing = db.execute(
+            "SELECT target_uri, relation_type FROM l3_relations WHERE source_uri = ? AND relation_type = ?",
+            (uri, rel_type),
+        ).fetchall()
+        incoming = db.execute(
+            "SELECT source_uri, relation_type FROM l3_relations WHERE target_uri = ? AND relation_type = ?",
+            (uri, rel_type),
+        ).fetchall()
+    else:
+        outgoing = db.execute(
+            "SELECT target_uri, relation_type FROM l3_relations WHERE source_uri = ?",
+            (uri,),
+        ).fetchall()
+        incoming = db.execute(
+            "SELECT source_uri, relation_type FROM l3_relations WHERE target_uri = ?",
+            (uri,),
+        ).fetchall()
+
     for r in outgoing:
-        _trace_recursive(db, r["target_uri"], current_depth + 1, max_depth, visited)
+        _trace_recursive(db, r["target_uri"], current_depth + 1, max_depth, visited, rel_type)
         if current_depth + 1 <= max_depth:
             print(f"{indent}  └─[{r['relation_type']}]→")
 
-    incoming = db.execute(
-        "SELECT source_uri, relation_type FROM l3_relations WHERE target_uri = ?",
-        (uri,),
-    ).fetchall()
     for r in incoming:
-        _trace_recursive(db, r["source_uri"], current_depth + 1, max_depth, visited)
+        _trace_recursive(db, r["source_uri"], current_depth + 1, max_depth, visited, rel_type)
         if current_depth + 1 <= max_depth:
             print(f"{indent}  ←[{r['relation_type']}]─")
 
+
+# ── Timeline (temporal chain traversal) ──
+
+def cmd_timeline(db, uri: str, depth: int = 5):
+    """Temporal timeline — follow precedes/follows chains to show chronological context.
+    
+    precedes = source happened before target
+    follows  = source happened after target (inverse of precedes)
+    """
+    print(f"\nTimeline: {uri}")
+    print("=" * 50)
+
+    # Forward: follow "precedes" from source (earlier → later)
+    print("\n>>> Forward (precedes chain — earlier to later):")
+    _timeline_forward(db, uri, 0, depth, set())
+
+    # Backward: follow "precedes" from target side (later → earlier view)
+    print("\n<<< Backward (follows chain — later to earlier):")
+    _timeline_backward(db, uri, 0, depth, set())
+
+    print(f"\n{'=' * 50}")
+
+
+def _timeline_forward(db, uri: str, current_depth: int, max_depth: int, visited: set):
+    if current_depth > max_depth or uri in visited:
+        return
+    visited.add(uri)
+    indent = "  " * current_depth
+    tag_str = _get_tags_str(db, uri)
+    marker = "●" if current_depth == 0 else "▶"
+    arrow = "" if current_depth == 0 else "  ──[precedes]──→"
+    print(f"{indent}{arrow}")
+    print(f"{indent}{marker} {uri}{tag_str}")
+
+    # precedes: source precedes target → target is later
+    for r in db.execute(
+        "SELECT target_uri FROM l3_relations WHERE source_uri = ? AND relation_type = 'precedes'",
+        (uri,),
+    ).fetchall():
+        _timeline_forward(db, r["target_uri"], current_depth + 1, max_depth, visited)
+
+    # follows inverse: target follows source → source is actually later
+    # (A follows B means B happened before A)
+    for r in db.execute(
+        "SELECT source_uri FROM l3_relations WHERE target_uri = ? AND relation_type = 'follows'",
+        (uri,),
+    ).fetchall():
+        _timeline_forward(db, r["source_uri"], current_depth + 1, max_depth, visited)
+
+
+def _timeline_backward(db, uri: str, current_depth: int, max_depth: int, visited: set):
+    if current_depth > max_depth or uri in visited:
+        return
+    visited.add(uri)
+    indent = "  " * current_depth
+    tag_str = _get_tags_str(db, uri)
+    marker = "⊙" if current_depth == 0 else "◀"
+    arrow = "" if current_depth == 0 else "  ←[precedes]──"
+    print(f"{indent}{arrow}")
+    print(f"{indent}{marker} {uri}{tag_str}")
+
+    # precedes backward: who preceded this node? → source is earlier
+    for r in db.execute(
+        "SELECT source_uri FROM l3_relations WHERE target_uri = ? AND relation_type = 'precedes'",
+        (uri,),
+    ).fetchall():
+        _timeline_backward(db, r["source_uri"], current_depth + 1, max_depth, visited)
+
+    # follows forward: what does this follow? → target is earlier
+    for r in db.execute(
+        "SELECT target_uri FROM l3_relations WHERE source_uri = ? AND relation_type = 'follows'",
+        (uri,),
+    ).fetchall():
+        _timeline_backward(db, r["target_uri"], current_depth + 1, max_depth, visited)
+
+
+# ── Stats ──
 
 def cmd_stats(db):
     tags = db.execute("SELECT COUNT(*) as c FROM l3_tags").fetchone()["c"]
@@ -222,8 +349,9 @@ def cmd_stats(db):
             print(f"    {r['relation_type']}: {r['cnt']}")
 
 
+# ── Main ──
+
 def main():
-    import argparse
     parser = argparse.ArgumentParser(description="L3 — Tag-based knowledge graph layer over SQLite")
     parser.add_argument("--db", default=DEFAULT_DB, help="SQLite database path (default: L3_DB_PATH env or ./l3.db)")
 
@@ -239,7 +367,8 @@ def main():
     p_rel = sub.add_parser("relate", help="Create a relation between two nodes")
     p_rel.add_argument("source", help="Source URI")
     p_rel.add_argument("target", help="Target URI")
-    p_rel.add_argument("relation", nargs="?", default="related_to", help="Relation type (default: related_to)")
+    p_rel.add_argument("relation", nargs="?", default="related_to",
+                       help="Relation type (default: related_to). Temporal: precedes, follows, contemporaneous")
 
     # unrelate
     p_unrel = sub.add_parser("unrelate", help="Remove a relation")
@@ -255,7 +384,12 @@ def main():
     # trace
     p_trace = sub.add_parser("trace", help="Graph traversal from a node")
     p_trace.add_argument("uri", help="Node URI to start traversal from")
+    p_trace.add_argument("relation", nargs="?", default=None, help="Filter by relation type")
     p_trace.add_argument("--depth", type=int, default=2, help="Traversal depth (default: 2)")
+
+    # timeline
+    p_tl = sub.add_parser("timeline", help="Temporal timeline following precedes/follows chains")
+    p_tl.add_argument("uri", help="Node URI to start timeline from")
 
     # stats
     sub.add_parser("stats", help="Show database statistics")
@@ -289,7 +423,10 @@ def main():
             cmd_search_tag_all(db)
 
     elif args.command == "trace":
-        cmd_trace(db, args.uri, args.depth)
+        cmd_trace(db, args.uri, args.depth, args.relation)
+
+    elif args.command == "timeline":
+        cmd_timeline(db, args.uri)
 
     elif args.command == "stats":
         cmd_stats(db)
