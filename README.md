@@ -369,6 +369,7 @@ memory-enhancer is part of a zero-dependency Hermes tool suite:
 | Project | Purpose |
 |---|---|
 | **memory-enhancer (this)** | Cross-session semantic memory via SQLite |
+| [codex-cli-memory-enhancer](https://github.com/wmyung/codex-cli-memory-enhancer) | Same engine, adapted for Codex CLI — per-project DBs, importance scoring |
 | [skillctl](https://github.com/wmyung/skillctl) | Skill context manager — trim `available_skills`, reclaim prompt context |
 | [Hermes SQLite Toolkit](https://github.com/wmyung/hermes-sqlite-toolkit) | Tool cache, artifact registry, decision log — structured data for agents |
 
