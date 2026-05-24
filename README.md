@@ -362,6 +362,18 @@ PRs welcome. Ideas welcome.
 
 ---
 
+## Sibling Projects
+
+memory-enhancer is part of a zero-dependency Hermes tool suite:
+
+| Project | Purpose |
+|---|---|
+| **memory-enhancer (this)** | Cross-session semantic memory via SQLite |
+| [skillctl](https://github.com/wmyung/skillctl) | Skill context manager — trim `available_skills`, reclaim prompt context |
+| [Hermes SQLite Toolkit](https://github.com/wmyung/hermes-sqlite-toolkit) | Tool cache, artifact registry, decision log — structured data for agents |
+
+All three are zero-dependency Python tools that use SQLite under the hood.
+
 ## Related
 
 - **[Codex CLI Memory Enhancer](https://github.com/wmyung/codex-cli-memory-enhancer)** — the same memory system, adapted for OpenAI Codex CLI, with L3 graph layer included
